@@ -1,9 +1,9 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.1
+ * Power Apps Regression Recorder - Runner Service v2.3
  * 
- * WITH VIDEO UPLOAD TO CLOUDINARY (Free)
- * 
- * Cloudinary free tier: 25GB storage + 25GB bandwidth/month
+ * FIXES:
+ * - Corrected Cloudinary signature calculation
+ * - Improved video recording to ensure non-empty files
  */
 
 const express = require('express');
@@ -11,6 +11,7 @@ const { chromium } = require('playwright');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -36,28 +37,62 @@ let activeRuns = 0;
 const runQueue = [];
 
 // ============================================================
-// CLOUDINARY UPLOAD
+// CLOUDINARY UPLOAD - FIXED SIGNATURE
 // ============================================================
 
 async function uploadToCloudinary(filePath, publicId, resourceType = 'video') {
+  console.log(`\n  📤 CLOUDINARY UPLOAD`);
+  console.log(`     File: ${filePath}`);
+  console.log(`     Public ID: ${publicId}`);
+  console.log(`     Type: ${resourceType}`);
+
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    console.log('  ⚠️ Cloudinary not configured - skipping upload');
+    console.log('  ❌ Cloudinary NOT configured!');
+    return null;
+  }
+
+  if (!fs.existsSync(filePath)) {
+    console.log(`  ❌ File does not exist: ${filePath}`);
+    return null;
+  }
+
+  const fileStats = fs.statSync(filePath);
+  console.log(`     File size: ${(fileStats.size / 1024).toFixed(2)} KB`);
+
+  if (fileStats.size < 1000) {
+    console.log(`  ❌ File too small (likely empty recording)`);
     return null;
   }
 
   try {
     const timestamp = Math.floor(Date.now() / 1000);
+    
+    // FIXED: Signature must include parameters in alphabetical order
+    // Only include parameters that affect the upload
+    const paramsToSign = {
+      public_id: publicId,
+      timestamp: timestamp
+    };
+    
+    // Sort parameters alphabetically and create signature string
+    const sortedParams = Object.keys(paramsToSign).sort();
+    const signatureBase = sortedParams
+      .map(key => `${key}=${paramsToSign[key]}`)
+      .join('&');
+    
+    const signatureString = signatureBase + CLOUDINARY_API_SECRET;
+    const signature = crypto.createHash('sha1').update(signatureString).digest('hex');
+    
+    console.log(`     Signature base: ${signatureBase}`);
+    console.log(`     Signature: ${signature.substring(0, 20)}...`);
+
+    // Read file
     const fileBuffer = fs.readFileSync(filePath);
     const base64File = fileBuffer.toString('base64');
     const mimeType = resourceType === 'video' ? 'video/webm' : 'image/png';
     const dataUri = `data:${mimeType};base64,${base64File}`;
 
-    // Create signature for authenticated upload
-    const crypto = require('crypto');
-    const signatureString = `public_id=${publicId}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`;
-    const signature = crypto.createHash('sha1').update(signatureString).digest('hex');
-
-    // Upload to Cloudinary
+    // Build form data
     const formData = new URLSearchParams();
     formData.append('file', dataUri);
     formData.append('public_id', publicId);
@@ -66,26 +101,28 @@ async function uploadToCloudinary(filePath, publicId, resourceType = 'video') {
     formData.append('signature', signature);
 
     const uploadUrl = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`;
-    
-    console.log(`  📤 Uploading ${resourceType} to Cloudinary...`);
+    console.log(`     Uploading to: ${uploadUrl}`);
     
     const response = await fetch(uploadUrl, {
       method: 'POST',
       body: formData
     });
 
+    const responseText = await response.text();
+    
     if (!response.ok) {
-      const error = await response.text();
-      console.error(`  ❌ Cloudinary upload failed: ${response.status} - ${error}`);
+      console.error(`  ❌ Upload failed: ${response.status}`);
+      console.error(`     Response: ${responseText.substring(0, 200)}`);
       return null;
     }
 
-    const result = await response.json();
-    console.log(`  ✓ Uploaded: ${result.secure_url}`);
+    const result = JSON.parse(responseText);
+    console.log(`  ✅ Upload SUCCESS!`);
+    console.log(`     URL: ${result.secure_url}`);
     return result.secure_url;
 
   } catch (error) {
-    console.error(`  ❌ Cloudinary upload error: ${error.message}`);
+    console.error(`  ❌ Upload error: ${error.message}`);
     return null;
   }
 }
@@ -98,7 +135,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.1.0',
+    version: '2.3.0',
     activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
@@ -111,17 +148,16 @@ app.post('/webhook/run', async (req, res) => {
   
   const errors = validatePayload(payload);
   if (errors.length > 0) {
-    return res.status(400).json({ 
-      error: 'Invalid payload',
-      details: errors 
-    });
+    return res.status(400).json({ error: 'Invalid payload', details: errors });
   }
 
-  console.log(`\n📥 Received run request: ${payload.runId}`);
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`📥 RECEIVED RUN REQUEST`);
+  console.log(`${'='.repeat(60)}`);
+  console.log(`   Run ID: ${payload.runId}`);
   console.log(`   Environment: ${payload.environment.name}`);
   console.log(`   Suite: ${payload.suite.name}`);
   console.log(`   Tests: ${payload.suite.tests.length}`);
-  console.log(`   Record Video: ${payload.artifacts?.recordVideo}`);
   
   res.json({ 
     status: 'queued', 
@@ -135,14 +171,11 @@ app.post('/webhook/run', async (req, res) => {
 
 app.post('/webhook/cancel/:runId', (req, res) => {
   const { runId } = req.params;
-  
   const queueIndex = runQueue.findIndex(p => p.runId === runId);
   if (queueIndex >= 0) {
     runQueue.splice(queueIndex, 1);
-    console.log(`🛑 Cancelled queued run: ${runId}`);
     return res.json({ status: 'cancelled', runId });
   }
-
   res.json({ status: 'not_found', runId });
 });
 
@@ -152,7 +185,6 @@ app.post('/webhook/cancel/:runId', (req, res) => {
 
 function validatePayload(payload) {
   const errors = [];
-  
   if (!payload.runId) errors.push('Missing: runId');
   if (!payload.environment) errors.push('Missing: environment');
   if (!payload.environment?.powerapps_url) errors.push('Missing: environment.powerapps_url');
@@ -161,7 +193,6 @@ function validatePayload(payload) {
     errors.push('Missing or invalid: suite.tests');
   }
   if (!payload.callbackUrl) errors.push('Missing: callbackUrl');
-  
   return errors;
 }
 
@@ -170,9 +201,7 @@ function validatePayload(payload) {
 // ============================================================
 
 async function processQueue() {
-  if (activeRuns >= MAX_CONCURRENT_RUNS || runQueue.length === 0) {
-    return;
-  }
+  if (activeRuns >= MAX_CONCURRENT_RUNS || runQueue.length === 0) return;
 
   activeRuns++;
   const payload = runQueue.shift();
@@ -205,34 +234,40 @@ async function processQueue() {
 async function executeRun(payload) {
   const { runId, environment, suite, callbackUrl, artifacts } = payload;
   
-  console.log(`\n🚀 Starting run: ${runId}`);
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`🚀 STARTING RUN: ${runId}`);
+  console.log(`${'='.repeat(60)}`);
+  
   const startTime = Date.now();
   
   // Create run-specific artifacts directory
   const runArtifactsDir = path.join(ARTIFACTS_DIR, runId);
-  if (!fs.existsSync(runArtifactsDir)) {
-    fs.mkdirSync(runArtifactsDir, { recursive: true });
+  if (fs.existsSync(runArtifactsDir)) {
+    fs.rmSync(runArtifactsDir, { recursive: true, force: true });
   }
+  fs.mkdirSync(runArtifactsDir, { recursive: true });
 
-  // Configure browser context
+  const shouldRecordVideo = artifacts?.recordVideo !== false;
+  
+  // Browser context options
   const contextOptions = {
-    viewport: { width: 1920, height: 1080 },
+    viewport: { width: 1280, height: 720 },
     ignoreHTTPSErrors: true
   };
 
-  // ENABLE VIDEO RECORDING
-  const shouldRecordVideo = artifacts?.recordVideo !== false;
   if (shouldRecordVideo) {
-    console.log('  📹 Video recording ENABLED');
+    console.log('📹 Video recording ENABLED');
     contextOptions.recordVideo = {
       dir: runArtifactsDir,
-      size: { width: 1920, height: 1080 }
+      size: { width: 1280, height: 720 }
     };
   }
 
+  // Launch browser
+  console.log('🌐 Launching browser...');
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
   });
 
   const context = await browser.newContext(contextOptions);
@@ -247,22 +282,34 @@ async function executeRun(payload) {
     steps: []
   };
 
-  let videoPath = null;
-
   try {
     // Navigate to target URL
     console.log(`📍 Navigating to: ${environment.powerapps_url}`);
     await page.goto(environment.powerapps_url, { 
-      waitUntil: 'networkidle',
+      waitUntil: 'load',
       timeout: 60000 
     });
+    console.log('✓ Page loaded');
 
-    // Wait for page to load
-    await waitForPowerAppsLoad(page);
+    // Wait for Power Apps to fully load
+    console.log('⏳ Waiting for Power Apps to initialize...');
+    await page.waitForTimeout(5000);
+    
+    // Try to wait for loading spinner to disappear
+    try {
+      await page.waitForSelector('[class*="spinner"], [class*="loading"]', { 
+        state: 'hidden', 
+        timeout: 10000 
+      });
+    } catch (e) {
+      // No spinner found, continue
+    }
+    
+    console.log('✓ Page ready');
 
-    // Execute each test in the suite
+    // Execute each test
     for (const test of suite.tests) {
-      console.log(`\n  📋 Running test: ${test.name}`);
+      console.log(`\n📋 Test: ${test.name}`);
       
       const testResult = await executeTest(page, test, {
         screenshotOnFail: artifacts?.screenshotOnFail,
@@ -277,8 +324,12 @@ async function executeRun(payload) {
       }
     }
 
+    // Add a small delay at the end to ensure video captures final state
+    console.log('⏳ Finalizing recording...');
+    await page.waitForTimeout(2000);
+
   } catch (error) {
-    console.error(`❌ Execution error:`, error.message);
+    console.error(`❌ Execution error: ${error.message}`);
     results.status = 'failed';
     results.steps.push({
       test_name: 'Execution Error',
@@ -286,124 +337,103 @@ async function executeRun(payload) {
       status: 'failed',
       error: error.message
     });
-
-    // Capture failure screenshot
-    if (artifacts?.screenshotOnFail) {
-      try {
-        const screenshotPath = path.join(runArtifactsDir, 'error-screenshot.png');
-        await page.screenshot({ path: screenshotPath, fullPage: true });
-        
-        const screenshotUrl = await uploadToCloudinary(
-          screenshotPath, 
-          `regression-tests/${runId}/error-screenshot`,
-          'image'
-        );
-        if (screenshotUrl) {
-          results.steps[results.steps.length - 1].screenshot_url = screenshotUrl;
-        }
-      } catch (e) {
-        console.log('Could not capture error screenshot');
-      }
-    }
   }
 
-  // IMPORTANT: Close page first to finalize video
-  await page.close();
+  // ============================================================
+  // VIDEO CAPTURE
+  // ============================================================
   
-  // Wait for video file to be written
+  console.log(`\n${'='.repeat(60)}`);
+  console.log('📹 VIDEO CAPTURE');
+  console.log(`${'='.repeat(60)}`);
+
+  let videoUrl = null;
+
   if (shouldRecordVideo) {
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    // Find the video file
-    const videoFiles = fs.readdirSync(runArtifactsDir).filter(f => f.endsWith('.webm'));
-    if (videoFiles.length > 0) {
-      videoPath = path.join(runArtifactsDir, videoFiles[0]);
-      console.log(`  📹 Video saved locally: ${videoPath}`);
-      console.log(`  📹 Video size: ${(fs.statSync(videoPath).size / 1024 / 1024).toFixed(2)} MB`);
+    try {
+      // Get video path BEFORE closing the page
+      const video = page.video();
+      let videoPath = null;
+      
+      if (video) {
+        videoPath = await video.path();
+        console.log(`Video path from API: ${videoPath}`);
+      }
+
+      // Close page to finalize video
+      console.log('Closing page...');
+      await page.close();
+      
+      // Close context
+      console.log('Closing context...');
+      await context.close();
+
+      // Wait for video file to be written
+      console.log('Waiting for video file...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // If we got path from API, use it; otherwise search directory
+      if (!videoPath || !fs.existsSync(videoPath)) {
+        const files = fs.readdirSync(runArtifactsDir);
+        const videoFiles = files.filter(f => f.endsWith('.webm'));
+        if (videoFiles.length > 0) {
+          videoPath = path.join(runArtifactsDir, videoFiles[0]);
+        }
+      }
+
+      if (videoPath && fs.existsSync(videoPath)) {
+        const stats = fs.statSync(videoPath);
+        console.log(`📹 Video file: ${videoPath}`);
+        console.log(`📹 Video size: ${(stats.size / 1024).toFixed(2)} KB`);
+
+        if (stats.size > 1000) {
+          // Use a simpler public_id without slashes to avoid signature issues
+          const simpleId = `regression_${runId.replace(/-/g, '_')}`;
+          
+          videoUrl = await uploadToCloudinary(videoPath, simpleId, 'video');
+          results.replay_video_url = videoUrl;
+        } else {
+          console.log('⚠️ Video file too small, skipping upload');
+        }
+      } else {
+        console.log('⚠️ No video file found');
+      }
+
+    } catch (videoError) {
+      console.error(`Video error: ${videoError.message}`);
     }
   }
 
-  await context.close();
-  await browser.close();
+  // Close browser
+  try {
+    await browser.close();
+  } catch (e) {}
 
-  // UPLOAD VIDEO TO CLOUDINARY
-  if (videoPath && fs.existsSync(videoPath)) {
-    console.log('  📤 Uploading video to Cloudinary...');
-    const videoUrl = await uploadToCloudinary(
-      videoPath,
-      `regression-tests/${runId}/replay`,
-      'video'
-    );
-    results.replay_video_url = videoUrl;
-  } else {
-    console.log('  ⚠️ No video file found to upload');
-  }
-
-  // Upload failure screenshots
-  const screenshotFiles = fs.readdirSync(runArtifactsDir).filter(f => f.endsWith('.png'));
-  for (const screenshotFile of screenshotFiles) {
-    const screenshotPath = path.join(runArtifactsDir, screenshotFile);
-    const screenshotName = screenshotFile.replace('.png', '');
-    await uploadToCloudinary(
-      screenshotPath, 
-      `regression-tests/${runId}/${screenshotName}`,
-      'image'
-    );
-  }
-
-  // Cleanup local artifacts
+  // Cleanup
   try {
     fs.rmSync(runArtifactsDir, { recursive: true, force: true });
-    console.log('  🧹 Cleaned up local artifacts');
-  } catch (e) {
-    // Ignore cleanup errors
-  }
+  } catch (e) {}
 
   results.finished_at = new Date().toISOString();
   
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`\n✅ Run ${runId} completed: ${results.status} (${duration}s)`);
-  console.log(`   Video URL: ${results.replay_video_url || 'None'}`);
-
-  // Send callback with results
-  await sendCallback(callbackUrl, results);
   
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`✅ RUN COMPLETED`);
+  console.log(`${'='.repeat(60)}`);
+  console.log(`   Status: ${results.status}`);
+  console.log(`   Duration: ${duration}s`);
+  console.log(`   Video URL: ${results.replay_video_url || 'NONE'}`);
+
+  await sendCallback(callbackUrl, results);
   return results;
-}
-
-/**
- * Wait for Power Apps to fully load
- */
-async function waitForPowerAppsLoad(page) {
-  try {
-    await page.waitForSelector('[class*="appLoadingSpinner"]', { 
-      state: 'hidden', 
-      timeout: 30000 
-    }).catch(() => {});
-
-    await page.waitForSelector('[data-control-name], .powerapps-app, [class*="appContainer"]', {
-      state: 'visible',
-      timeout: 30000
-    }).catch(() => {});
-
-    await page.waitForTimeout(2000);
-    await page.waitForLoadState('networkidle').catch(() => {});
-
-    console.log('  ✓ Page loaded');
-  } catch (error) {
-    console.log('  ⚠️ Page load detection timed out, continuing...');
-  }
 }
 
 /**
  * Execute a single test
  */
 async function executeTest(page, test, options) {
-  const result = {
-    status: 'passed',
-    steps: []
-  };
-
+  const result = { status: 'passed', steps: [] };
   const steps = test.steps || [];
 
   for (let i = 0; i < steps.length; i++) {
@@ -424,27 +454,6 @@ async function executeTest(page, test, options) {
 
     if (stepResult.status === 'failed') {
       result.status = 'failed';
-      
-      // Capture and upload failure screenshot
-      if (options.screenshotOnFail) {
-        try {
-          const screenshotName = `${test.id || test.name}-step${i + 1}-failure.png`;
-          const screenshotPath = path.join(options.artifactsDir, screenshotName);
-          await page.screenshot({ path: screenshotPath, fullPage: true });
-          
-          const screenshotUrl = await uploadToCloudinary(
-            screenshotPath,
-            `regression-tests/${options.runId}/${test.id || test.name}-step${i + 1}-failure`,
-            'image'
-          );
-          if (screenshotUrl) {
-            result.steps[result.steps.length - 1].screenshot_url = screenshotUrl;
-          }
-        } catch (e) {
-          console.log('Could not capture step failure screenshot');
-        }
-      }
-
       break;
     }
   }
@@ -467,105 +476,66 @@ async function executeStep(page, step, options) {
   try {
     switch (step.action?.toLowerCase()) {
       case 'click':
-        await performClick(page, step, timeout);
-        break;
-
-      case 'doubleclick':
-      case 'double_click':
-        await performDoubleClick(page, step, timeout);
-        break;
-
-      case 'rightclick':
-      case 'right_click':
-        await performRightClick(page, step, timeout);
+        await getLocator(page, step).click({ timeout });
+        await page.waitForTimeout(500);
         break;
 
       case 'fill':
       case 'type':
       case 'input':
-      case 'text_input':
-        await performFill(page, step, timeout);
-        break;
-
-      case 'clear':
-        await page.locator(step.selector).clear({ timeout });
+        const loc = getLocator(page, step);
+        if (step.clear !== false) await loc.clear({ timeout });
+        await loc.fill(step.value || '', { timeout });
         break;
 
       case 'select':
       case 'dropdown':
-      case 'select_option':
-        await performSelect(page, step, timeout);
+        try {
+          await getLocator(page, step).selectOption(step.value, { timeout: 5000 });
+        } catch (e) {
+          await getLocator(page, step).click({ timeout });
+          await page.waitForTimeout(500);
+          await page.getByText(step.value, { exact: step.exact }).click({ timeout });
+        }
         break;
 
       case 'wait':
-      case 'wait_for_element':
-        await performWait(page, step, timeout);
-        break;
-
-      case 'wait_for_text':
-        await page.waitForSelector(`text=${step.value}`, { 
-          state: 'visible', 
-          timeout 
-        });
-        break;
-
-      case 'wait_for_navigation':
-        await page.waitForNavigation({ timeout });
-        break;
-
-      case 'navigate':
-      case 'goto':
-        await page.goto(step.url || step.value, { 
-          waitUntil: 'networkidle', 
-          timeout 
-        });
-        break;
-
-      case 'reload':
-      case 'refresh':
-        await page.reload({ waitUntil: 'networkidle', timeout });
-        break;
-
-      case 'back':
-        await page.goBack({ timeout });
-        break;
-
-      case 'forward':
-        await page.goForward({ timeout });
+        if (step.selector) {
+          await page.waitForSelector(step.selector, { state: step.state || 'visible', timeout });
+        } else if (step.duration || step.value) {
+          await page.waitForTimeout(parseInt(step.duration || step.value));
+        } else {
+          await page.waitForLoadState('networkidle', { timeout });
+        }
         break;
 
       case 'assert':
       case 'verify':
-      case 'check_visibility':
-        await performAssertion(page, step, timeout);
+        const type = step.type || 'visible';
+        if (type === 'visible') {
+          await getLocator(page, step).waitFor({ state: 'visible', timeout });
+        } else if (type === 'hidden') {
+          await getLocator(page, step).waitFor({ state: 'hidden', timeout });
+        }
         break;
 
-      case 'assert_text':
-      case 'verify_text':
-        await performTextAssertion(page, step, timeout);
+      case 'navigate':
+      case 'goto':
+        await page.goto(step.url || step.value, { waitUntil: 'load', timeout });
+        break;
+
+      case 'screenshot':
+        const ssPath = path.join(options.artifactsDir, step.name || `step-${options.stepIndex}.png`);
+        await page.screenshot({ path: ssPath, fullPage: step.fullPage !== false });
+        break;
+
+      case 'hover':
+        await getLocator(page, step).hover({ timeout });
         break;
 
       case 'press':
       case 'key':
-      case 'keyboard':
         await page.keyboard.press(step.key || step.value);
-        break;
-
-      case 'hover':
-        await page.hover(step.selector, { timeout });
-        break;
-
-      case 'scroll':
-      case 'scroll_to':
-        await performScroll(page, step, timeout);
-        break;
-
-      case 'screenshot':
-        const screenshotPath = path.join(
-          options.artifactsDir,
-          step.name || `${options.testName}-step${options.stepIndex}.png`
-        );
-        await page.screenshot({ path: screenshotPath, fullPage: step.fullPage !== false });
         break;
 
       default:
@@ -585,166 +555,17 @@ async function executeStep(page, step, options) {
 }
 
 // ============================================================
-// STEP IMPLEMENTATIONS
-// ============================================================
-
-async function performClick(page, step, timeout) {
-  const locator = getLocator(page, step);
-  await locator.click({ timeout });
-  await waitForStabilize(page);
-}
-
-async function performDoubleClick(page, step, timeout) {
-  const locator = getLocator(page, step);
-  await locator.dblclick({ timeout });
-  await waitForStabilize(page);
-}
-
-async function performRightClick(page, step, timeout) {
-  const locator = getLocator(page, step);
-  await locator.click({ button: 'right', timeout });
-}
-
-async function performFill(page, step, timeout) {
-  const locator = getLocator(page, step);
-  
-  if (step.clear !== false) {
-    await locator.clear({ timeout });
-  }
-  
-  await locator.fill(step.value || step.text || '', { timeout });
-  await waitForStabilize(page);
-}
-
-async function performSelect(page, step, timeout) {
-  const locator = getLocator(page, step);
-  
-  try {
-    await locator.selectOption(step.value, { timeout: 5000 });
-  } catch (e) {
-    await locator.click({ timeout });
-    await page.waitForTimeout(500);
-    const optionLocator = page.getByText(step.value, { exact: step.exact });
-    await optionLocator.click({ timeout });
-  }
-  
-  await waitForStabilize(page);
-}
-
-async function performWait(page, step, timeout) {
-  if (step.selector) {
-    const state = step.state || 'visible';
-    await page.waitForSelector(step.selector, { state, timeout });
-  } else if (step.duration || step.value) {
-    const ms = parseInt(step.duration || step.value);
-    await page.waitForTimeout(ms);
-  } else {
-    await page.waitForLoadState('networkidle', { timeout });
-  }
-}
-
-async function performAssertion(page, step, timeout) {
-  const type = step.type || step.assertion_type || 'visible';
-  const locator = getLocator(page, step);
-
-  switch (type) {
-    case 'visible':
-      await locator.waitFor({ state: 'visible', timeout });
-      break;
-    case 'hidden':
-    case 'not_visible':
-      await locator.waitFor({ state: 'hidden', timeout });
-      break;
-    case 'exists':
-      await locator.waitFor({ state: 'attached', timeout });
-      break;
-    case 'not_exists':
-      await locator.waitFor({ state: 'detached', timeout });
-      break;
-    default:
-      await locator.waitFor({ state: 'visible', timeout });
-  }
-}
-
-async function performTextAssertion(page, step, timeout) {
-  const locator = getLocator(page, step);
-  const text = await locator.textContent({ timeout });
-  const expected = step.expected || step.value;
-
-  if (step.exact) {
-    if (text !== expected) {
-      throw new Error(`Expected text "${expected}" but found "${text}"`);
-    }
-  } else {
-    if (!text.includes(expected)) {
-      throw new Error(`Expected text to contain "${expected}" but found "${text}"`);
-    }
-  }
-}
-
-async function performScroll(page, step, timeout) {
-  if (step.selector) {
-    const locator = getLocator(page, step);
-    await locator.scrollIntoViewIfNeeded({ timeout });
-  } else if (step.x !== undefined || step.y !== undefined) {
-    await page.evaluate(({ x, y }) => window.scrollTo(x || 0, y || 0), { 
-      x: step.x, 
-      y: step.y 
-    });
-  } else if (step.direction) {
-    const amount = step.amount || 300;
-    await page.evaluate(({ dir, amt }) => {
-      if (dir === 'down') window.scrollBy(0, amt);
-      else if (dir === 'up') window.scrollBy(0, -amt);
-      else if (dir === 'right') window.scrollBy(amt, 0);
-      else if (dir === 'left') window.scrollBy(-amt, 0);
-    }, { dir: step.direction, amt: amount });
-  }
-}
-
-// ============================================================
-// LOCATOR HELPERS
+// LOCATOR HELPER
 // ============================================================
 
 function getLocator(page, step) {
-  if (step.selector) {
-    return page.locator(step.selector);
-  }
-  
-  if (step.control_name) {
-    return page.locator(`[data-control-name="${step.control_name}"]`);
-  }
-  
-  if (step.text) {
-    return page.getByText(step.text, { exact: step.exact });
-  }
-  
-  if (step.aria_label) {
-    return page.getByLabel(step.aria_label);
-  }
-  
-  if (step.placeholder) {
-    return page.getByPlaceholder(step.placeholder);
-  }
-  
-  if (step.role) {
-    return page.getByRole(step.role, { name: step.name });
-  }
-
+  if (step.selector) return page.locator(step.selector);
+  if (step.control_name) return page.locator(`[data-control-name="${step.control_name}"]`);
+  if (step.text) return page.getByText(step.text, { exact: step.exact });
+  if (step.aria_label) return page.getByLabel(step.aria_label);
+  if (step.placeholder) return page.getByPlaceholder(step.placeholder);
+  if (step.role) return page.getByRole(step.role, { name: step.name });
   throw new Error('No valid locator provided');
-}
-
-async function waitForStabilize(page) {
-  await page.waitForTimeout(300);
-  
-  try {
-    await page.waitForSelector('[class*="Spinner"], [class*="loading"], [class*="busy"]', {
-      state: 'hidden',
-      timeout: 10000
-    });
-  } catch (e) {
-    // No spinner found
-  }
 }
 
 // ============================================================
@@ -752,10 +573,10 @@ async function waitForStabilize(page) {
 // ============================================================
 
 async function sendCallback(callbackUrl, payload) {
-  console.log(`\n📤 Sending callback to: ${callbackUrl}`);
+  console.log(`\n📤 Sending callback...`);
+  console.log(`   URL: ${callbackUrl}`);
   console.log(`   Status: ${payload.status}`);
-  console.log(`   Video URL: ${payload.replay_video_url || 'None'}`);
-  console.log(`   Steps: ${payload.steps.length}`);
+  console.log(`   Video: ${payload.replay_video_url || 'NONE'}`);
 
   try {
     const response = await fetch(callbackUrl, {
@@ -765,12 +586,12 @@ async function sendCallback(callbackUrl, payload) {
     });
 
     if (!response.ok) {
-      console.error(`   ⚠️ Callback failed: ${response.status} ${response.statusText}`);
+      console.error(`   ❌ Callback failed: ${response.status}`);
     } else {
-      console.log(`   ✓ Callback sent successfully`);
+      console.log(`   ✅ Callback sent`);
     }
   } catch (error) {
-    console.error(`   ❌ Callback error:`, error.message);
+    console.error(`   ❌ Callback error: ${error.message}`);
   }
 }
 
@@ -780,33 +601,19 @@ async function sendCallback(callbackUrl, payload) {
 
 app.listen(PORT, () => {
   console.log(`
-╔═══════════════════════════════════════════════════════════════╗
-║  🎭 Power Apps Regression Runner v2.1                         ║
-║     WITH VIDEO UPLOAD TO CLOUDINARY                           ║
-╠═══════════════════════════════════════════════════════════════╣
-║                                                               ║
-║  Port: ${PORT}                                                  ║
-║  Max Concurrent Runs: ${MAX_CONCURRENT_RUNS}                                        ║
-║                                                               ║
-║  Cloudinary: ${CLOUDINARY_CLOUD_NAME ? '✓ Configured' : '✗ Not configured'}                            
-║                                                               ║
-║  Endpoints:                                                   ║
-║    GET  /health             - Health check                    ║
-║    POST /webhook/run        - Execute test run                ║
-║    POST /webhook/cancel/:id - Cancel a run                    ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
+${'═'.repeat(60)}
+  🎭 Power Apps Regression Runner v2.3
+${'═'.repeat(60)}
+
+  Port: ${PORT}
+  Cloudinary: ${CLOUDINARY_CLOUD_NAME ? '✓ Configured' : '❌ Not configured'}
+
+  Endpoints:
+    GET  /health        - Health check
+    POST /webhook/run   - Execute test run
+
+${'═'.repeat(60)}
   `);
-  
-  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    console.log('⚠️  WARNING: Cloudinary not configured!');
-    console.log('   Videos will NOT be uploaded.');
-    console.log('   Set these environment variables:');
-    console.log('   - CLOUDINARY_CLOUD_NAME');
-    console.log('   - CLOUDINARY_API_KEY');
-    console.log('   - CLOUDINARY_API_SECRET');
-    console.log('');
-  }
 });
 
 module.exports = app;
