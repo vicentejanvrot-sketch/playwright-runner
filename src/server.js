@@ -1,10 +1,7 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.5
+ * Power Apps Regression Recorder - Runner Service v2.6
  * 
- * WITH FULL STEP VERIFICATION DATA
- * - Screenshots at each step
- * - Assertion evidence
- * - Visual diff support
+ * FIXED CALLBACK PAYLOAD FORMAT FOR LOVABLE
  */
 
 const express = require('express');
@@ -91,7 +88,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.5.0',
+    version: '2.6.0',
     activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
@@ -166,19 +163,29 @@ async function processQueue() {
     await executeRun(payload);
   } catch (error) {
     console.error(`❌ Run ${payload.runId} failed:`, error.message);
+    
+    // Send error callback in Lovable's expected format
     await sendCallback(payload.callbackUrl, {
       run_id: payload.runId,
-      status: 'failed',
-      finished_at: new Date().toISOString(),
+      overall_status: 'failed',
       replay_video_url: null,
-      steps: [{
-        test_name: 'Runner Error',
-        step_name: 'Initialization',
-        step_index: 0,
+      test_results: [{
+        test_case_id: 'runner-error',
         status: 'failed',
-        error: error.message,
-        started_at: new Date().toISOString(),
-        finished_at: new Date().toISOString()
+        steps: [{
+          step_index: 0,
+          action_type: 'initialize',
+          target_summary: 'Runner Initialization',
+          status: 'failed',
+          error_message: error.message,
+          screenshot_url: null,
+          assertion_evidence: [{
+            type: 'error',
+            expected: 'Runner to start successfully',
+            actual: error.message,
+            passed: false
+          }]
+        }]
       }]
     });
   } finally {
@@ -234,12 +241,12 @@ async function executeRun(payload) {
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
 
+  // Results in LOVABLE'S EXPECTED FORMAT
   const results = {
     run_id: runId,
-    status: 'passed',
-    finished_at: null,
+    overall_status: 'passed',
     replay_video_url: null,
-    steps: []
+    test_results: []
   };
 
   try {
@@ -266,17 +273,22 @@ async function executeRun(payload) {
 
     // Execute each test
     for (const test of suite.tests) {
-      console.log(`\n📋 Test: ${test.name}`);
+      console.log(`\n📋 Test: ${test.name} (ID: ${test.id || 'no-id'})`);
       
       const testResult = await executeTest(page, test, {
         artifactsDir: runArtifactsDir,
         runId
       });
 
-      results.steps.push(...testResult.steps);
+      // Add to test_results array in Lovable's format
+      results.test_results.push({
+        test_case_id: test.id || test.name,
+        status: testResult.status,
+        steps: testResult.steps
+      });
 
       if (testResult.status === 'failed') {
-        results.status = 'failed';
+        results.overall_status = 'failed';
       }
     }
 
@@ -285,30 +297,37 @@ async function executeRun(payload) {
 
   } catch (error) {
     console.error(`❌ Execution error: ${error.message}`);
-    results.status = 'failed';
+    results.overall_status = 'failed';
     
     // Capture error screenshot
     const errorScreenshotPath = path.join(runArtifactsDir, 'error_screenshot.png');
+    let errorScreenshotUrl = null;
     try {
       await page.screenshot({ path: errorScreenshotPath, fullPage: true });
+      errorScreenshotUrl = await uploadToCloudinary(
+        errorScreenshotPath,
+        `run_${runId.replace(/-/g, '_')}_error`,
+        'image'
+      );
     } catch (e) {}
     
-    const errorScreenshotUrl = await uploadToCloudinary(
-      errorScreenshotPath,
-      `run_${runId.replace(/-/g, '_')}_error`,
-      'image'
-    );
-    
-    results.steps.push({
-      test_name: 'Execution Error',
-      step_name: 'Browser Error',
-      step_index: results.steps.length,
-      action: 'error',
+    results.test_results.push({
+      test_case_id: 'execution-error',
       status: 'failed',
-      error: error.message,
-      screenshot_url: errorScreenshotUrl,
-      started_at: new Date().toISOString(),
-      finished_at: new Date().toISOString()
+      steps: [{
+        step_index: 0,
+        action_type: 'browser_error',
+        target_summary: 'Browser Execution',
+        status: 'failed',
+        error_message: error.message,
+        screenshot_url: errorScreenshotUrl,
+        assertion_evidence: [{
+          type: 'error',
+          expected: 'Test execution to complete',
+          actual: error.message,
+          passed: false
+        }]
+      }]
     });
   }
 
@@ -370,16 +389,14 @@ async function executeRun(payload) {
     fs.rmSync(runArtifactsDir, { recursive: true, force: true });
   } catch (e) {}
 
-  results.finished_at = new Date().toISOString();
-  
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
   
   console.log(`\n${'='.repeat(60)}`);
   console.log(`✅ RUN COMPLETED`);
   console.log(`${'='.repeat(60)}`);
-  console.log(`   Status: ${results.status}`);
+  console.log(`   Status: ${results.overall_status}`);
   console.log(`   Duration: ${duration}s`);
-  console.log(`   Steps: ${results.steps.length}`);
+  console.log(`   Tests: ${results.test_results.length}`);
   console.log(`   Video: ${results.replay_video_url ? 'Yes' : 'No'}`);
 
   await sendCallback(callbackUrl, results);
@@ -387,7 +404,7 @@ async function executeRun(payload) {
 }
 
 /**
- * Execute a single test with step-by-step screenshots
+ * Execute a single test - returns steps in Lovable's format
  */
 async function executeTest(page, test, options) {
   const result = { status: 'passed', steps: [] };
@@ -395,77 +412,69 @@ async function executeTest(page, test, options) {
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    const stepStartTime = new Date().toISOString();
     
-    console.log(`    Step ${i + 1}: ${step.action}`);
+    console.log(`    Step ${i}: ${step.action}`);
 
-    // Take BEFORE screenshot
+    // Take BEFORE screenshot (baseline)
     const beforeScreenshotPath = path.join(
       options.artifactsDir,
-      `step_${i + 1}_before.png`
+      `step_${i}_before.png`
     );
     await page.screenshot({ path: beforeScreenshotPath });
 
     // Execute the step
-    const stepResult = await executeStep(page, step, {
-      ...options,
-      testName: test.name,
-      stepIndex: i + 1
-    });
+    const stepExecution = await executeStep(page, step);
 
     // Take AFTER screenshot
     const afterScreenshotPath = path.join(
       options.artifactsDir,
-      `step_${i + 1}_after.png`
+      `step_${i}_after.png`
     );
     await page.screenshot({ path: afterScreenshotPath });
 
     // Upload screenshots to Cloudinary
     const runIdClean = options.runId.replace(/-/g, '_');
     
-    const beforeUrl = await uploadToCloudinary(
-      beforeScreenshotPath,
-      `run_${runIdClean}_step_${i + 1}_before`,
+    const screenshotUrl = await uploadToCloudinary(
+      afterScreenshotPath,
+      `run_${runIdClean}_step_${i}`,
       'image'
     );
     
-    const afterUrl = await uploadToCloudinary(
-      afterScreenshotPath,
-      `run_${runIdClean}_step_${i + 1}_after`,
+    const baselineUrl = await uploadToCloudinary(
+      beforeScreenshotPath,
+      `run_${runIdClean}_step_${i}_baseline`,
       'image'
     );
 
-    // Build step result with full verification data
-    const fullStepResult = {
-      test_name: test.name,
-      step_name: step.name || step.description || `Step ${i + 1}`,
-      step_index: i + 1,
-      action: step.action,
-      target: step.selector || step.control_name || step.text || null,
-      value: step.value || null,
-      status: stepResult.status,
-      error: stepResult.error,
-      started_at: stepStartTime,
-      finished_at: new Date().toISOString(),
-      
-      // Verification data for Lovable
-      screenshot_url: afterUrl,
-      baseline_screenshot_url: beforeUrl,
-      assertion_evidence: {
-        action_performed: step.action,
-        target_element: step.selector || step.control_name || step.text || 'N/A',
-        expected_outcome: getExpectedOutcome(step),
-        actual_outcome: stepResult.status === 'passed' ? 'Success' : stepResult.error,
-        verified: stepResult.status === 'passed'
-      },
-      visual_diff_score: stepResult.status === 'passed' ? 100 : 0
+    // Build step result in LOVABLE'S EXPECTED FORMAT
+    const stepResult = {
+      step_index: i,
+      action_type: step.action?.toLowerCase() || 'unknown',
+      target_summary: step.name || step.description || getTargetSummary(step),
+      status: stepExecution.status,
+      screenshot_url: screenshotUrl,
+      baseline_screenshot_url: baselineUrl,
+      visual_diff_score: stepExecution.status === 'passed' ? 100 : 0,
+      assertion_evidence: [{
+        type: step.action?.toLowerCase() || 'action',
+        expected: getExpectedOutcome(step),
+        actual: stepExecution.status === 'passed' 
+          ? 'Action completed successfully' 
+          : stepExecution.error,
+        passed: stepExecution.status === 'passed'
+      }]
     };
 
-    result.steps.push(fullStepResult);
+    if (stepExecution.error) {
+      stepResult.error_message = stepExecution.error;
+    }
 
-    if (stepResult.status === 'failed') {
+    result.steps.push(stepResult);
+
+    if (stepExecution.status === 'failed') {
       result.status = 'failed';
-      console.log(`    ✗ Failed: ${stepResult.error}`);
+      console.log(`    ✗ Failed: ${stepExecution.error}`);
       break;
     } else {
       console.log(`    ✓ Passed`);
@@ -476,19 +485,32 @@ async function executeTest(page, test, options) {
 }
 
 /**
- * Get expected outcome description for a step
+ * Get a human-readable target summary
+ */
+function getTargetSummary(step) {
+  if (step.selector) return `Element: ${step.selector}`;
+  if (step.control_name) return `Control: ${step.control_name}`;
+  if (step.text) return `Text: "${step.text}"`;
+  if (step.aria_label) return `Label: ${step.aria_label}`;
+  if (step.placeholder) return `Placeholder: ${step.placeholder}`;
+  if (step.url || step.value) return step.url || step.value;
+  return 'Unknown target';
+}
+
+/**
+ * Get expected outcome description
  */
 function getExpectedOutcome(step) {
   switch (step.action?.toLowerCase()) {
     case 'click':
-      return `Element should be clickable and respond to click`;
+      return `Click on element should succeed`;
     case 'fill':
     case 'type':
     case 'input':
-      return `Input should accept value: "${step.value || ''}"`;
+      return `Input value "${step.value || ''}" should be entered`;
     case 'select':
     case 'dropdown':
-      return `Dropdown should select option: "${step.value || ''}"`;
+      return `Option "${step.value || ''}" should be selected`;
     case 'wait':
       return `Element should become ${step.state || 'visible'}`;
     case 'assert':
@@ -496,18 +518,18 @@ function getExpectedOutcome(step) {
       return `Element should be ${step.type || 'visible'}`;
     case 'navigate':
     case 'goto':
-      return `Page should navigate to URL`;
+      return `Page should navigate successfully`;
     case 'hover':
-      return `Element should respond to hover`;
+      return `Hover action should succeed`;
     default:
-      return `Action "${step.action}" should complete successfully`;
+      return `Action "${step.action}" should complete`;
   }
 }
 
 /**
  * Execute a single step
  */
-async function executeStep(page, step, options) {
+async function executeStep(page, step) {
   const result = {
     status: 'passed',
     error: null
@@ -568,7 +590,6 @@ async function executeStep(page, step, options) {
         break;
 
       case 'screenshot':
-        // Screenshot is taken automatically, just wait
         break;
 
       case 'hover':
@@ -611,11 +632,14 @@ function getLocator(page, step) {
 // ============================================================
 
 async function sendCallback(callbackUrl, payload) {
-  console.log(`\n📤 Sending callback...`);
+  console.log(`\n📤 Sending callback to Lovable...`);
   console.log(`   URL: ${callbackUrl}`);
-  console.log(`   Status: ${payload.status}`);
-  console.log(`   Steps: ${payload.steps.length}`);
-  console.log(`   Video: ${payload.replay_video_url ? 'Yes' : 'No'}`);
+  console.log(`   overall_status: ${payload.overall_status}`);
+  console.log(`   test_results: ${payload.test_results.length} test(s)`);
+  
+  // Log the full payload for debugging
+  console.log(`\n   📋 CALLBACK PAYLOAD:`);
+  console.log(JSON.stringify(payload, null, 2));
 
   try {
     const response = await fetch(callbackUrl, {
@@ -624,11 +648,14 @@ async function sendCallback(callbackUrl, payload) {
       body: JSON.stringify(payload)
     });
 
+    const responseText = await response.text();
+    
     if (!response.ok) {
-      const text = await response.text();
-      console.error(`   ❌ Callback failed: ${response.status} - ${text}`);
+      console.error(`   ❌ Callback failed: ${response.status}`);
+      console.error(`   Response: ${responseText}`);
     } else {
       console.log(`   ✅ Callback sent successfully`);
+      console.log(`   Response: ${responseText}`);
     }
   } catch (error) {
     console.error(`   ❌ Callback error: ${error.message}`);
@@ -642,18 +669,19 @@ async function sendCallback(callbackUrl, payload) {
 app.listen(PORT, () => {
   console.log(`
 ${'═'.repeat(60)}
-  🎭 Power Apps Regression Runner v2.5
-     WITH FULL STEP VERIFICATION
+  🎭 Power Apps Regression Runner v2.6
+     LOVABLE-COMPATIBLE CALLBACK FORMAT
 ${'═'.repeat(60)}
 
   Port: ${PORT}
   Cloudinary: ${cloudinary ? '✓ Configured' : '❌ Not configured'}
 
-  Features:
-    ✓ Screenshot at each step (before & after)
-    ✓ Assertion evidence
-    ✓ Visual diff support
-    ✓ Video recording
+  Callback Format:
+    ✓ overall_status (not "status")
+    ✓ test_results[] array
+    ✓ step_index, action_type, target_summary
+    ✓ screenshot_url per step
+    ✓ assertion_evidence[] array
 
   Endpoints:
     GET  /health        - Health check
