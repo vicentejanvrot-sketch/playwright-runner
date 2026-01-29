@@ -31,8 +31,8 @@ RUN apt-get update && apt-get install -y \
 # Copy package files
 COPY package.json ./
 
-# Install Node.js dependencies
-RUN npm install --only=production
+# Install Node.js dependencies (using npm install, NOT npm ci)
+RUN npm install --omit=dev
 
 # Install Playwright browsers (this ensures version match!)
 RUN npx playwright install chromium
@@ -51,43 +51,8 @@ ENV CLOUDINARY_CLOUD_NAME=""
 ENV CLOUDINARY_API_KEY=""
 ENV CLOUDINARY_API_SECRET=""
 
+# Expose port
 EXPOSE 3001
 
+# Start the service
 CMD ["npm", "start"]
-```
-
-### 2. Replace `package.json`
-(In the ZIP file)
-
-### 3. Replace `src/server.js`
-(In the ZIP file - has improved video capture and detailed logging)
-
----
-
-## ⚠️ Important: Clear Build Cache
-
-After updating GitHub, go to Render:
-
-1. Go to your service → **Settings**
-2. Scroll to **Build & Deploy**
-3. Click **"Clear build cache & deploy"**
-
-This forces a fresh build with the new Dockerfile.
-
----
-
-## ✅ After Deploy - Check Logs
-
-Look for these messages:
-```
-🎭 Power Apps Regression Runner v2.2
-Cloud Name: your-cloud-name
-API Key: ✓ SET
-API Secret: ✓ SET
-```
-
-Then run a test and look for:
-```
-📹 VIDEO RECORDING: ENABLED
-🌐 Launching browser...
-✓ Browser launched
