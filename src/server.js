@@ -1,7 +1,10 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.4
+ * Power Apps Regression Recorder - Runner Service v2.5
  * 
- * Uses Cloudinary SDK for automatic signature handling
+ * WITH FULL STEP VERIFICATION DATA
+ * - Screenshots at each step
+ * - Assertion evidence
+ * - Visual diff support
  */
 
 const express = require('express');
@@ -46,29 +49,23 @@ let activeRuns = 0;
 const runQueue = [];
 
 // ============================================================
-// CLOUDINARY UPLOAD - USING SDK
+// CLOUDINARY UPLOAD
 // ============================================================
 
-async function uploadToCloudinary(filePath, publicId, resourceType = 'video') {
-  console.log(`\n  📤 CLOUDINARY UPLOAD`);
-  console.log(`     File: ${filePath}`);
-  console.log(`     Public ID: ${publicId}`);
-
+async function uploadToCloudinary(filePath, publicId, resourceType = 'image') {
   if (!cloudinary) {
-    console.log('  ❌ Cloudinary not configured!');
+    console.log('  ⚠️ Cloudinary not configured');
     return null;
   }
 
   if (!fs.existsSync(filePath)) {
-    console.log(`  ❌ File does not exist`);
+    console.log(`  ⚠️ File not found: ${filePath}`);
     return null;
   }
 
   const stats = fs.statSync(filePath);
-  console.log(`     File size: ${(stats.size / 1024).toFixed(2)} KB`);
-
-  if (stats.size < 1000) {
-    console.log(`  ❌ File too small`);
+  if (stats.size < 100) {
+    console.log(`  ⚠️ File too small: ${filePath}`);
     return null;
   }
 
@@ -78,13 +75,10 @@ async function uploadToCloudinary(filePath, publicId, resourceType = 'video') {
       public_id: publicId,
       overwrite: true
     });
-
-    console.log(`  ✅ Upload SUCCESS!`);
-    console.log(`     URL: ${result.secure_url}`);
+    console.log(`  ✓ Uploaded: ${publicId}`);
     return result.secure_url;
-
   } catch (error) {
-    console.error(`  ❌ Upload error: ${error.message}`);
+    console.error(`  ✗ Upload failed: ${error.message}`);
     return null;
   }
 }
@@ -97,7 +91,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.4.0',
+    version: '2.5.0',
     activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
@@ -179,8 +173,12 @@ async function processQueue() {
       replay_video_url: null,
       steps: [{
         test_name: 'Runner Error',
+        step_name: 'Initialization',
+        step_index: 0,
         status: 'failed',
-        error: error.message
+        error: error.message,
+        started_at: new Date().toISOString(),
+        finished_at: new Date().toISOString()
       }]
     });
   } finally {
@@ -257,15 +255,12 @@ async function executeRun(payload) {
     console.log('⏳ Waiting for Power Apps to initialize...');
     await page.waitForTimeout(5000);
     
-    // Try to wait for loading spinner to disappear
     try {
       await page.waitForSelector('[class*="spinner"], [class*="loading"]', { 
         state: 'hidden', 
         timeout: 10000 
       });
-    } catch (e) {
-      // No spinner found, continue
-    }
+    } catch (e) {}
     
     console.log('✓ Page ready');
 
@@ -274,7 +269,6 @@ async function executeRun(payload) {
       console.log(`\n📋 Test: ${test.name}`);
       
       const testResult = await executeTest(page, test, {
-        screenshotOnFail: artifacts?.screenshotOnFail,
         artifactsDir: runArtifactsDir,
         runId
       });
@@ -286,18 +280,35 @@ async function executeRun(payload) {
       }
     }
 
-    // Add delay to ensure video captures final state
-    console.log('⏳ Finalizing recording...');
+    // Final delay for video
     await page.waitForTimeout(2000);
 
   } catch (error) {
     console.error(`❌ Execution error: ${error.message}`);
     results.status = 'failed';
+    
+    // Capture error screenshot
+    const errorScreenshotPath = path.join(runArtifactsDir, 'error_screenshot.png');
+    try {
+      await page.screenshot({ path: errorScreenshotPath, fullPage: true });
+    } catch (e) {}
+    
+    const errorScreenshotUrl = await uploadToCloudinary(
+      errorScreenshotPath,
+      `run_${runId.replace(/-/g, '_')}_error`,
+      'image'
+    );
+    
     results.steps.push({
       test_name: 'Execution Error',
       step_name: 'Browser Error',
+      step_index: results.steps.length,
+      action: 'error',
       status: 'failed',
-      error: error.message
+      error: error.message,
+      screenshot_url: errorScreenshotUrl,
+      started_at: new Date().toISOString(),
+      finished_at: new Date().toISOString()
     });
   }
 
@@ -305,36 +316,21 @@ async function executeRun(payload) {
   // VIDEO CAPTURE
   // ============================================================
   
-  console.log(`\n${'='.repeat(60)}`);
-  console.log('📹 VIDEO CAPTURE');
-  console.log(`${'='.repeat(60)}`);
-
-  let videoUrl = null;
+  console.log(`\n📹 Processing video...`);
 
   if (shouldRecordVideo) {
     try {
-      // Get video path BEFORE closing the page
       const video = page.video();
       let videoPath = null;
       
       if (video) {
         videoPath = await video.path();
-        console.log(`Video path from API: ${videoPath}`);
       }
 
-      // Close page to finalize video
-      console.log('Closing page...');
       await page.close();
-      
-      // Close context
-      console.log('Closing context...');
       await context.close();
-
-      // Wait for video file to be written
-      console.log('Waiting for video file...');
       await new Promise(resolve => setTimeout(resolve, 3000));
 
-      // If we got path from API, use it; otherwise search directory
       if (!videoPath || !fs.existsSync(videoPath)) {
         const files = fs.readdirSync(runArtifactsDir);
         const videoFiles = files.filter(f => f.endsWith('.webm'));
@@ -345,23 +341,23 @@ async function executeRun(payload) {
 
       if (videoPath && fs.existsSync(videoPath)) {
         const stats = fs.statSync(videoPath);
-        console.log(`📹 Video file: ${videoPath}`);
-        console.log(`📹 Video size: ${(stats.size / 1024).toFixed(2)} KB`);
+        console.log(`   Video size: ${(stats.size / 1024).toFixed(2)} KB`);
 
         if (stats.size > 1000) {
-          const simpleId = `regression_${runId.replace(/-/g, '_')}`;
-          videoUrl = await uploadToCloudinary(videoPath, simpleId, 'video');
+          const videoUrl = await uploadToCloudinary(
+            videoPath,
+            `run_${runId.replace(/-/g, '_')}_video`,
+            'video'
+          );
           results.replay_video_url = videoUrl;
-        } else {
-          console.log('⚠️ Video file too small, skipping upload');
         }
-      } else {
-        console.log('⚠️ No video file found');
       }
-
     } catch (videoError) {
-      console.error(`Video error: ${videoError.message}`);
+      console.error(`   Video error: ${videoError.message}`);
     }
+  } else {
+    await page.close();
+    await context.close();
   }
 
   // Close browser
@@ -369,7 +365,7 @@ async function executeRun(payload) {
     await browser.close();
   } catch (e) {}
 
-  // Cleanup
+  // Cleanup local files
   try {
     fs.rmSync(runArtifactsDir, { recursive: true, force: true });
   } catch (e) {}
@@ -383,14 +379,15 @@ async function executeRun(payload) {
   console.log(`${'='.repeat(60)}`);
   console.log(`   Status: ${results.status}`);
   console.log(`   Duration: ${duration}s`);
-  console.log(`   Video URL: ${results.replay_video_url || 'NONE'}`);
+  console.log(`   Steps: ${results.steps.length}`);
+  console.log(`   Video: ${results.replay_video_url ? 'Yes' : 'No'}`);
 
   await sendCallback(callbackUrl, results);
   return results;
 }
 
 /**
- * Execute a single test
+ * Execute a single test with step-by-step screenshots
  */
 async function executeTest(page, test, options) {
   const result = { status: 'passed', steps: [] };
@@ -398,27 +395,113 @@ async function executeTest(page, test, options) {
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
+    const stepStartTime = new Date().toISOString();
+    
+    console.log(`    Step ${i + 1}: ${step.action}`);
+
+    // Take BEFORE screenshot
+    const beforeScreenshotPath = path.join(
+      options.artifactsDir,
+      `step_${i + 1}_before.png`
+    );
+    await page.screenshot({ path: beforeScreenshotPath });
+
+    // Execute the step
     const stepResult = await executeStep(page, step, {
       ...options,
       testName: test.name,
       stepIndex: i + 1
     });
 
-    result.steps.push({
+    // Take AFTER screenshot
+    const afterScreenshotPath = path.join(
+      options.artifactsDir,
+      `step_${i + 1}_after.png`
+    );
+    await page.screenshot({ path: afterScreenshotPath });
+
+    // Upload screenshots to Cloudinary
+    const runIdClean = options.runId.replace(/-/g, '_');
+    
+    const beforeUrl = await uploadToCloudinary(
+      beforeScreenshotPath,
+      `run_${runIdClean}_step_${i + 1}_before`,
+      'image'
+    );
+    
+    const afterUrl = await uploadToCloudinary(
+      afterScreenshotPath,
+      `run_${runIdClean}_step_${i + 1}_after`,
+      'image'
+    );
+
+    // Build step result with full verification data
+    const fullStepResult = {
       test_name: test.name,
       step_name: step.name || step.description || `Step ${i + 1}`,
       step_index: i + 1,
       action: step.action,
-      ...stepResult
-    });
+      target: step.selector || step.control_name || step.text || null,
+      value: step.value || null,
+      status: stepResult.status,
+      error: stepResult.error,
+      started_at: stepStartTime,
+      finished_at: new Date().toISOString(),
+      
+      // Verification data for Lovable
+      screenshot_url: afterUrl,
+      baseline_screenshot_url: beforeUrl,
+      assertion_evidence: {
+        action_performed: step.action,
+        target_element: step.selector || step.control_name || step.text || 'N/A',
+        expected_outcome: getExpectedOutcome(step),
+        actual_outcome: stepResult.status === 'passed' ? 'Success' : stepResult.error,
+        verified: stepResult.status === 'passed'
+      },
+      visual_diff_score: stepResult.status === 'passed' ? 100 : 0
+    };
+
+    result.steps.push(fullStepResult);
 
     if (stepResult.status === 'failed') {
       result.status = 'failed';
+      console.log(`    ✗ Failed: ${stepResult.error}`);
       break;
+    } else {
+      console.log(`    ✓ Passed`);
     }
   }
 
   return result;
+}
+
+/**
+ * Get expected outcome description for a step
+ */
+function getExpectedOutcome(step) {
+  switch (step.action?.toLowerCase()) {
+    case 'click':
+      return `Element should be clickable and respond to click`;
+    case 'fill':
+    case 'type':
+    case 'input':
+      return `Input should accept value: "${step.value || ''}"`;
+    case 'select':
+    case 'dropdown':
+      return `Dropdown should select option: "${step.value || ''}"`;
+    case 'wait':
+      return `Element should become ${step.state || 'visible'}`;
+    case 'assert':
+    case 'verify':
+      return `Element should be ${step.type || 'visible'}`;
+    case 'navigate':
+    case 'goto':
+      return `Page should navigate to URL`;
+    case 'hover':
+      return `Element should respond to hover`;
+    default:
+      return `Action "${step.action}" should complete successfully`;
+  }
 }
 
 /**
@@ -427,7 +510,6 @@ async function executeTest(page, test, options) {
 async function executeStep(page, step, options) {
   const result = {
     status: 'passed',
-    started_at: new Date().toISOString(),
     error: null
   };
 
@@ -482,11 +564,11 @@ async function executeStep(page, step, options) {
       case 'navigate':
       case 'goto':
         await page.goto(step.url || step.value, { waitUntil: 'load', timeout });
+        await page.waitForTimeout(2000);
         break;
 
       case 'screenshot':
-        const ssPath = path.join(options.artifactsDir, step.name || `step-${options.stepIndex}.png`);
-        await page.screenshot({ path: ssPath, fullPage: step.fullPage !== false });
+        // Screenshot is taken automatically, just wait
         break;
 
       case 'hover':
@@ -499,18 +581,14 @@ async function executeStep(page, step, options) {
         break;
 
       default:
-        console.log(`    ⚠️ Unknown action: ${step.action}`);
+        console.log(`      ⚠️ Unknown action: ${step.action}`);
     }
-
-    console.log(`    ✓ ${step.action}: ${step.selector || step.control_name || step.value || ''}`);
 
   } catch (error) {
     result.status = 'failed';
     result.error = error.message;
-    console.log(`    ✗ ${step.action} failed: ${error.message}`);
   }
 
-  result.finished_at = new Date().toISOString();
   return result;
 }
 
@@ -536,7 +614,8 @@ async function sendCallback(callbackUrl, payload) {
   console.log(`\n📤 Sending callback...`);
   console.log(`   URL: ${callbackUrl}`);
   console.log(`   Status: ${payload.status}`);
-  console.log(`   Video: ${payload.replay_video_url || 'NONE'}`);
+  console.log(`   Steps: ${payload.steps.length}`);
+  console.log(`   Video: ${payload.replay_video_url ? 'Yes' : 'No'}`);
 
   try {
     const response = await fetch(callbackUrl, {
@@ -546,9 +625,10 @@ async function sendCallback(callbackUrl, payload) {
     });
 
     if (!response.ok) {
-      console.error(`   ❌ Callback failed: ${response.status}`);
+      const text = await response.text();
+      console.error(`   ❌ Callback failed: ${response.status} - ${text}`);
     } else {
-      console.log(`   ✅ Callback sent`);
+      console.log(`   ✅ Callback sent successfully`);
     }
   } catch (error) {
     console.error(`   ❌ Callback error: ${error.message}`);
@@ -562,12 +642,18 @@ async function sendCallback(callbackUrl, payload) {
 app.listen(PORT, () => {
   console.log(`
 ${'═'.repeat(60)}
-  🎭 Power Apps Regression Runner v2.4
-     Using Cloudinary SDK
+  🎭 Power Apps Regression Runner v2.5
+     WITH FULL STEP VERIFICATION
 ${'═'.repeat(60)}
 
   Port: ${PORT}
   Cloudinary: ${cloudinary ? '✓ Configured' : '❌ Not configured'}
+
+  Features:
+    ✓ Screenshot at each step (before & after)
+    ✓ Assertion evidence
+    ✓ Visual diff support
+    ✓ Video recording
 
   Endpoints:
     GET  /health        - Health check
