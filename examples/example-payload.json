@@ -1,0 +1,152 @@
+{
+  "runId": "run-2024-001-abc123",
+  "environment": {
+    "name": "Production",
+    "powerapps_url": "https://apps.powerapps.com/play/e/your-environment-id/a/your-app-id"
+  },
+  "suite": {
+    "name": "Login and Dashboard Tests",
+    "tests": [
+      {
+        "id": "test-001",
+        "name": "User Login Flow",
+        "steps": [
+          {
+            "action": "wait",
+            "selector": "[data-control-name='Screen1']",
+            "name": "Wait for main screen",
+            "timeout": 30000
+          },
+          {
+            "action": "click",
+            "control_name": "btnLogin",
+            "name": "Click login button"
+          },
+          {
+            "action": "fill",
+            "control_name": "txtUsername",
+            "value": "testuser@company.com",
+            "name": "Enter username"
+          },
+          {
+            "action": "fill",
+            "control_name": "txtPassword",
+            "value": "TestPassword123",
+            "name": "Enter password"
+          },
+          {
+            "action": "click",
+            "control_name": "btnSubmit",
+            "name": "Submit login"
+          },
+          {
+            "action": "wait",
+            "duration": "3000",
+            "name": "Wait for authentication"
+          },
+          {
+            "action": "assert",
+            "control_name": "lblWelcome",
+            "type": "visible",
+            "name": "Verify welcome message appears"
+          },
+          {
+            "action": "screenshot",
+            "name": "login-success.png"
+          }
+        ]
+      },
+      {
+        "id": "test-002",
+        "name": "Navigate to Dashboard",
+        "steps": [
+          {
+            "action": "click",
+            "control_name": "btnDashboard",
+            "name": "Click dashboard button"
+          },
+          {
+            "action": "wait",
+            "selector": "[data-control-name='galDashboardItems']",
+            "name": "Wait for dashboard gallery"
+          },
+          {
+            "action": "assert",
+            "control_name": "lblDashboardTitle",
+            "type": "visible",
+            "name": "Verify dashboard title"
+          },
+          {
+            "action": "assert_text",
+            "control_name": "lblItemCount",
+            "value": "Items:",
+            "name": "Verify items label exists"
+          },
+          {
+            "action": "screenshot",
+            "name": "dashboard-loaded.png"
+          }
+        ]
+      },
+      {
+        "id": "test-003",
+        "name": "Create New Record",
+        "steps": [
+          {
+            "action": "click",
+            "control_name": "btnNewRecord",
+            "name": "Click new record button"
+          },
+          {
+            "action": "wait",
+            "duration": "1000",
+            "name": "Wait for form to load"
+          },
+          {
+            "action": "fill",
+            "control_name": "txtRecordName",
+            "value": "Test Record - Automated",
+            "name": "Enter record name"
+          },
+          {
+            "action": "select",
+            "control_name": "ddCategory",
+            "value": "Category A",
+            "name": "Select category"
+          },
+          {
+            "action": "fill",
+            "control_name": "txtDescription",
+            "value": "This record was created by automated testing",
+            "name": "Enter description"
+          },
+          {
+            "action": "click",
+            "control_name": "btnSave",
+            "name": "Save the record"
+          },
+          {
+            "action": "wait",
+            "duration": "2000",
+            "name": "Wait for save"
+          },
+          {
+            "action": "assert",
+            "text": "Record saved successfully",
+            "type": "visible",
+            "name": "Verify success message"
+          },
+          {
+            "action": "screenshot",
+            "name": "record-created.png"
+          }
+        ]
+      }
+    ]
+  },
+  "callbackUrl": "https://your-project.supabase.co/functions/v1/receive-test-results",
+  "artifacts": {
+    "recordVideo": true,
+    "screenshotOnFail": true
+  }
+}

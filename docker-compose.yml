@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  runner:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - MAX_CONCURRENT_RUNS=3
+      - PUBLIC_URL=http://localhost:3001
+    volumes:
+      # Persist artifacts outside container
+      - ./artifacts:/app/artifacts
+    restart: unless-stopped
