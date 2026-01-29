@@ -1,12 +1,11 @@
 {
   "name": "powerapps-regression-runner",
-  "version": "1.0.0",
-  "description": "Playwright-based runner service for Power Apps Regression Recorder",
+  "version": "2.1.0",
+  "description": "Playwright-based runner service with Cloudinary video upload",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "test": "node test/test-runner.js"
+    "dev": "nodemon src/server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
