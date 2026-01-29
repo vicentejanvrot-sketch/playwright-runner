@@ -1,7 +1,7 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.7
+ * Power Apps Regression Recorder - Runner Service v2.8
  * 
- * WITH DETAILED PAYLOAD LOGGING & REQUIRED FIELDS
+ * FIXED: test_case_id must be UUID or null
  */
 
 const express = require('express');
@@ -46,23 +46,29 @@ let activeRuns = 0;
 const runQueue = [];
 
 // ============================================================
+// HELPER: Check if string is a valid UUID
+// ============================================================
+function isValidUUID(str) {
+  if (!str || typeof str !== 'string') return false;
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(str);
+}
+
+// ============================================================
 // CLOUDINARY UPLOAD
 // ============================================================
 
 async function uploadToCloudinary(filePath, publicId, resourceType = 'image') {
   if (!cloudinary) {
-    console.log('  ⚠️ Cloudinary not configured');
     return null;
   }
 
   if (!fs.existsSync(filePath)) {
-    console.log(`  ⚠️ File not found: ${filePath}`);
     return null;
   }
 
   const stats = fs.statSync(filePath);
   if (stats.size < 100) {
-    console.log(`  ⚠️ File too small: ${filePath}`);
     return null;
   }
 
@@ -88,7 +94,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.7.0',
+    version: '2.8.0',
     activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
@@ -99,41 +105,24 @@ app.get('/health', (req, res) => {
 app.post('/webhook/run', async (req, res) => {
   const payload = req.body;
   
-  // ============================================================
-  // LOG THE FULL INCOMING PAYLOAD FOR DEBUGGING
-  // ============================================================
   console.log(`\n${'='.repeat(60)}`);
-  console.log(`📥 INCOMING PAYLOAD (FULL)`);
+  console.log(`📥 INCOMING PAYLOAD`);
   console.log(`${'='.repeat(60)}`);
   console.log(JSON.stringify(payload, null, 2));
-  console.log(`${'='.repeat(60)}\n`);
   
   const errors = validatePayload(payload);
   if (errors.length > 0) {
     return res.status(400).json({ error: 'Invalid payload', details: errors });
   }
 
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`📥 RECEIVED RUN REQUEST`);
-  console.log(`${'='.repeat(60)}`);
-  console.log(`   Run ID: ${payload.runId}`);
-  console.log(`   Environment: ${payload.environment?.name}`);
-  console.log(`   Suite: ${payload.suite?.name}`);
+  console.log(`\n   Run ID: ${payload.runId}`);
   console.log(`   Tests: ${payload.suite?.tests?.length || 0}`);
   
-  // Log each test and its steps
+  // Log test IDs to verify they're UUIDs
   if (payload.suite?.tests) {
     payload.suite.tests.forEach((test, idx) => {
-      console.log(`\n   Test ${idx + 1}: ${test.name || test.id || 'unnamed'}`);
-      console.log(`      ID: ${test.id || 'no-id'}`);
-      console.log(`      Steps: ${test.steps?.length || 0}`);
-      if (test.steps && test.steps.length > 0) {
-        test.steps.forEach((step, sidx) => {
-          console.log(`        Step ${sidx}: ${step.action} - ${step.selector || step.control_name || step.text || step.url || 'no target'}`);
-        });
-      } else {
-        console.log(`      ⚠️ NO STEPS IN THIS TEST`);
-      }
+      const idType = isValidUUID(test.id) ? '✓ UUID' : '✗ NOT UUID';
+      console.log(`   Test ${idx + 1}: id="${test.id}" (${idType})`);
     });
   }
   
@@ -196,7 +185,7 @@ async function processQueue() {
       replay_video_url: null,
       error_message: error.message,
       test_results: [{
-        test_case_id: 'runner-error',
+        test_case_id: null,  // Use null instead of string
         steps: [{
           step_index: 0,
           action_type: 'initialize',
@@ -231,6 +220,7 @@ async function executeRun(payload) {
   console.log(`${'='.repeat(60)}`);
   
   const startTime = Date.now();
+  const runIdClean = runId.replace(/-/g, '_');
   
   // Create run-specific artifacts directory
   const runArtifactsDir = path.join(ARTIFACTS_DIR, runId);
@@ -241,7 +231,6 @@ async function executeRun(payload) {
 
   const shouldRecordVideo = artifacts?.recordVideo !== false;
   
-  // Browser context options
   const contextOptions = {
     viewport: { width: 1280, height: 720 },
     ignoreHTTPSErrors: true
@@ -255,7 +244,6 @@ async function executeRun(payload) {
     };
   }
 
-  // Launch browser
   console.log('🌐 Launching browser...');
   const browser = await chromium.launch({
     headless: true,
@@ -266,7 +254,6 @@ async function executeRun(payload) {
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
 
-  // Results in LOVABLE'S EXPECTED FORMAT
   const results = {
     run_id: runId,
     overall_status: 'passed',
@@ -274,17 +261,12 @@ async function executeRun(payload) {
     test_results: []
   };
 
-  let stepCounter = 0; // Global step counter for screenshots
+  let stepCounter = 0;
 
   try {
-    // ============================================================
-    // STEP 0: Navigate to Power Apps URL
-    // ============================================================
+    // Navigate to Power Apps URL
     const navStartTime = new Date().toISOString();
     console.log(`📍 Navigating to: ${environment.powerapps_url}`);
-    
-    // Take screenshot before navigation
-    const navBeforePath = path.join(runArtifactsDir, `step_${stepCounter}_nav_before.png`);
     
     await page.goto(environment.powerapps_url, { 
       waitUntil: 'load',
@@ -292,7 +274,6 @@ async function executeRun(payload) {
     });
     console.log('✓ Page loaded');
 
-    // Wait for Power Apps to fully load
     console.log('⏳ Waiting for Power Apps to initialize...');
     await page.waitForTimeout(5000);
     
@@ -305,20 +286,18 @@ async function executeRun(payload) {
     
     console.log('✓ Page ready');
 
-    // Take screenshot after navigation
-    const navAfterPath = path.join(runArtifactsDir, `step_${stepCounter}_nav_after.png`);
-    await page.screenshot({ path: navAfterPath });
-    
+    // Take navigation screenshot
+    const navScreenshotPath = path.join(runArtifactsDir, `step_${stepCounter}_nav.png`);
+    await page.screenshot({ path: navScreenshotPath });
     const navEndTime = new Date().toISOString();
-    const runIdClean = runId.replace(/-/g, '_');
     
     const navScreenshotUrl = await uploadToCloudinary(
-      navAfterPath,
+      navScreenshotPath,
       `run_${runIdClean}_step_${stepCounter}_nav`,
       'image'
     );
 
-    // Create a "navigation" step result
+    // Navigation step (will be added to each test)
     const navigationStep = {
       step_index: stepCounter,
       action_type: 'navigate',
@@ -337,29 +316,28 @@ async function executeRun(payload) {
     
     stepCounter++;
 
-    // ============================================================
     // Execute each test
-    // ============================================================
     for (const test of suite.tests) {
-      console.log(`\n📋 Test: ${test.name || test.id || 'unnamed'}`);
-      console.log(`   Test ID: ${test.id || 'no-id'}`);
-      console.log(`   Steps in test: ${test.steps?.length || 0}`);
+      console.log(`\n📋 Test: ${test.name}`);
+      
+      // CRITICAL: Use the UUID from Lovable, or null if not a valid UUID
+      const testCaseId = isValidUUID(test.id) ? test.id : null;
+      console.log(`   test_case_id: ${testCaseId} (from test.id: "${test.id}")`);
       
       const testSteps = test.steps || [];
-      const testResultSteps = [navigationStep]; // Start with navigation step
+      const testResultSteps = [navigationStep];
       let testStatus = 'passed';
 
-      // If no steps in the test, create a verification step
       if (testSteps.length === 0) {
-        console.log(`   ⚠️ No steps in test, creating verification step`);
+        console.log(`   ⚠️ No steps, creating verification step`);
         
         const verifyStartTime = new Date().toISOString();
-        const verifyScreenshotPath = path.join(runArtifactsDir, `step_${stepCounter}_verify.png`);
-        await page.screenshot({ path: verifyScreenshotPath });
+        const verifyPath = path.join(runArtifactsDir, `step_${stepCounter}_verify.png`);
+        await page.screenshot({ path: verifyPath });
         const verifyEndTime = new Date().toISOString();
         
-        const verifyScreenshotUrl = await uploadToCloudinary(
-          verifyScreenshotPath,
+        const verifyUrl = await uploadToCloudinary(
+          verifyPath,
           `run_${runIdClean}_step_${stepCounter}_verify`,
           'image'
         );
@@ -371,7 +349,7 @@ async function executeRun(payload) {
           status: 'passed',
           started_at: verifyStartTime,
           finished_at: verifyEndTime,
-          screenshot_url: verifyScreenshotUrl,
+          screenshot_url: verifyUrl,
           assertion_evidence: [{
             type: 'verification',
             expected: 'Page should be in expected state',
@@ -382,27 +360,22 @@ async function executeRun(payload) {
         
         stepCounter++;
       } else {
-        // Execute each step in the test
         for (let i = 0; i < testSteps.length; i++) {
           const step = testSteps[i];
           const stepStartTime = new Date().toISOString();
           
-          console.log(`    Step ${i}: ${step.action} - ${step.selector || step.control_name || step.text || ''}`);
+          console.log(`    Step ${i}: ${step.action}`);
 
-          // Take BEFORE screenshot
           const beforePath = path.join(runArtifactsDir, `step_${stepCounter}_before.png`);
           await page.screenshot({ path: beforePath });
 
-          // Execute the step
           const stepExecution = await executeStep(page, step);
 
-          // Take AFTER screenshot
           const afterPath = path.join(runArtifactsDir, `step_${stepCounter}_after.png`);
           await page.screenshot({ path: afterPath });
           
           const stepEndTime = new Date().toISOString();
 
-          // Upload screenshots
           const screenshotUrl = await uploadToCloudinary(
             afterPath,
             `run_${runIdClean}_step_${stepCounter}`,
@@ -415,8 +388,7 @@ async function executeRun(payload) {
             'image'
           );
 
-          // Build step result with ALL REQUIRED FIELDS
-          const stepResult = {
+          testResultSteps.push({
             step_index: stepCounter,
             action_type: step.action?.toLowerCase() || 'unknown',
             target_summary: step.name || step.description || getTargetSummary(step),
@@ -434,9 +406,8 @@ async function executeRun(payload) {
                 : stepExecution.error,
               passed: stepExecution.status === 'passed'
             }]
-          };
-
-          testResultSteps.push(stepResult);
+          });
+          
           stepCounter++;
 
           if (stepExecution.status === 'failed') {
@@ -450,31 +421,29 @@ async function executeRun(payload) {
         }
       }
 
-      // Add test result
+      // CRITICAL: test_case_id is UUID or null
       results.test_results.push({
-        test_case_id: test.id || test.name || `test-${results.test_results.length}`,
+        test_case_id: testCaseId,
         status: testStatus,
         steps: testResultSteps
       });
     }
 
-    // If no tests at all, create a default test result
+    // If no tests, create default with null test_case_id
     if (results.test_results.length === 0) {
-      console.log(`\n⚠️ No tests found, creating default verification`);
-      
       const defaultStartTime = new Date().toISOString();
-      const defaultScreenshotPath = path.join(runArtifactsDir, `step_${stepCounter}_default.png`);
-      await page.screenshot({ path: defaultScreenshotPath });
+      const defaultPath = path.join(runArtifactsDir, `step_${stepCounter}_default.png`);
+      await page.screenshot({ path: defaultPath });
       const defaultEndTime = new Date().toISOString();
       
-      const defaultScreenshotUrl = await uploadToCloudinary(
-        defaultScreenshotPath,
+      const defaultUrl = await uploadToCloudinary(
+        defaultPath,
         `run_${runIdClean}_step_${stepCounter}_default`,
         'image'
       );
       
       results.test_results.push({
-        test_case_id: 'default-verification',
+        test_case_id: null,  // null, not a string
         status: 'passed',
         steps: [
           navigationStep,
@@ -485,7 +454,7 @@ async function executeRun(payload) {
             status: 'passed',
             started_at: defaultStartTime,
             finished_at: defaultEndTime,
-            screenshot_url: defaultScreenshotUrl,
+            screenshot_url: defaultUrl,
             assertion_evidence: [{
               type: 'verification',
               expected: 'Page should load',
@@ -497,7 +466,6 @@ async function executeRun(payload) {
       });
     }
 
-    // Final delay for video
     await page.waitForTimeout(2000);
 
   } catch (error) {
@@ -507,22 +475,20 @@ async function executeRun(payload) {
     
     const errorTime = new Date().toISOString();
     
-    // Capture error screenshot
-    const errorScreenshotPath = path.join(runArtifactsDir, 'error_screenshot.png');
     let errorScreenshotUrl = null;
     try {
-      await page.screenshot({ path: errorScreenshotPath, fullPage: true });
+      const errorPath = path.join(runArtifactsDir, 'error_screenshot.png');
+      await page.screenshot({ path: errorPath, fullPage: true });
       errorScreenshotUrl = await uploadToCloudinary(
-        errorScreenshotPath,
-        `run_${runId.replace(/-/g, '_')}_error`,
+        errorPath,
+        `run_${runIdClean}_error`,
         'image'
       );
     } catch (e) {}
     
-    // Ensure we have at least one test result with steps
     if (results.test_results.length === 0) {
       results.test_results.push({
-        test_case_id: 'execution-error',
+        test_case_id: null,  // null, not a string
         status: 'failed',
         steps: [{
           step_index: 0,
@@ -543,10 +509,7 @@ async function executeRun(payload) {
     }
   }
 
-  // ============================================================
-  // VIDEO CAPTURE
-  // ============================================================
-  
+  // Video capture
   console.log(`\n📹 Processing video...`);
 
   if (shouldRecordVideo) {
@@ -577,7 +540,7 @@ async function executeRun(payload) {
         if (stats.size > 1000) {
           const videoUrl = await uploadToCloudinary(
             videoPath,
-            `run_${runId.replace(/-/g, '_')}_video`,
+            `run_${runIdClean}_video`,
             'video'
           );
           results.replay_video_url = videoUrl;
@@ -591,21 +554,11 @@ async function executeRun(payload) {
     await context.close();
   }
 
-  // Close browser
-  try {
-    await browser.close();
-  } catch (e) {}
-
-  // Cleanup local files
-  try {
-    fs.rmSync(runArtifactsDir, { recursive: true, force: true });
-  } catch (e) {}
+  try { await browser.close(); } catch (e) {}
+  try { fs.rmSync(runArtifactsDir, { recursive: true, force: true }); } catch (e) {}
 
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
   
-  // ============================================================
-  // LOG FINAL RESULTS
-  // ============================================================
   console.log(`\n${'='.repeat(60)}`);
   console.log(`✅ RUN COMPLETED`);
   console.log(`${'='.repeat(60)}`);
@@ -613,69 +566,42 @@ async function executeRun(payload) {
   console.log(`   Duration: ${duration}s`);
   console.log(`   Tests: ${results.test_results.length}`);
   
-  let totalSteps = 0;
   results.test_results.forEach((tr, idx) => {
-    console.log(`   Test ${idx + 1} (${tr.test_case_id}): ${tr.steps?.length || 0} steps`);
-    totalSteps += tr.steps?.length || 0;
+    console.log(`   Test ${idx + 1}: test_case_id=${tr.test_case_id}, steps=${tr.steps?.length}`);
   });
-  console.log(`   Total Steps: ${totalSteps}`);
-  console.log(`   Video: ${results.replay_video_url ? 'Yes' : 'No'}`);
 
   await sendCallback(callbackUrl, results);
   return results;
 }
 
-/**
- * Get a human-readable target summary
- */
 function getTargetSummary(step) {
   if (step.selector) return `Element: ${step.selector}`;
   if (step.control_name) return `Control: ${step.control_name}`;
   if (step.text) return `Text: "${step.text}"`;
   if (step.aria_label) return `Label: ${step.aria_label}`;
-  if (step.placeholder) return `Placeholder: ${step.placeholder}`;
   if (step.url || step.value) return step.url || step.value;
   return 'Unknown target';
 }
 
-/**
- * Get expected outcome description
- */
 function getExpectedOutcome(step) {
   switch (step.action?.toLowerCase()) {
-    case 'click':
-      return `Click on element should succeed`;
+    case 'click': return `Click on element should succeed`;
     case 'fill':
     case 'type':
-    case 'input':
-      return `Input value "${step.value || ''}" should be entered`;
+    case 'input': return `Input value "${step.value || ''}" should be entered`;
     case 'select':
-    case 'dropdown':
-      return `Option "${step.value || ''}" should be selected`;
-    case 'wait':
-      return `Element should become ${step.state || 'visible'}`;
+    case 'dropdown': return `Option "${step.value || ''}" should be selected`;
+    case 'wait': return `Element should become ${step.state || 'visible'}`;
     case 'assert':
-    case 'verify':
-      return `Element should be ${step.type || 'visible'}`;
+    case 'verify': return `Element should be ${step.type || 'visible'}`;
     case 'navigate':
-    case 'goto':
-      return `Page should navigate successfully`;
-    case 'hover':
-      return `Hover action should succeed`;
-    default:
-      return `Action "${step.action}" should complete`;
+    case 'goto': return `Page should navigate successfully`;
+    default: return `Action "${step.action}" should complete`;
   }
 }
 
-/**
- * Execute a single step
- */
 async function executeStep(page, step) {
-  const result = {
-    status: 'passed',
-    error: null
-  };
-
+  const result = { status: 'passed', error: null };
   const timeout = step.timeout || 30000;
 
   try {
@@ -684,7 +610,6 @@ async function executeStep(page, step) {
         await getLocator(page, step).click({ timeout });
         await page.waitForTimeout(500);
         break;
-
       case 'fill':
       case 'type':
       case 'input':
@@ -692,7 +617,6 @@ async function executeStep(page, step) {
         if (step.clear !== false) await loc.clear({ timeout });
         await loc.fill(step.value || '', { timeout });
         break;
-
       case 'select':
       case 'dropdown':
         try {
@@ -703,7 +627,6 @@ async function executeStep(page, step) {
           await page.getByText(step.value, { exact: step.exact }).click({ timeout });
         }
         break;
-
       case 'wait':
         if (step.selector) {
           await page.waitForSelector(step.selector, { state: step.state || 'visible', timeout });
@@ -713,39 +636,26 @@ async function executeStep(page, step) {
           await page.waitForLoadState('networkidle', { timeout });
         }
         break;
-
       case 'assert':
       case 'verify':
         const type = step.type || 'visible';
-        if (type === 'visible') {
-          await getLocator(page, step).waitFor({ state: 'visible', timeout });
-        } else if (type === 'hidden') {
-          await getLocator(page, step).waitFor({ state: 'hidden', timeout });
-        }
+        await getLocator(page, step).waitFor({ state: type, timeout });
         break;
-
       case 'navigate':
       case 'goto':
         await page.goto(step.url || step.value, { waitUntil: 'load', timeout });
         await page.waitForTimeout(2000);
         break;
-
-      case 'screenshot':
-        break;
-
       case 'hover':
         await getLocator(page, step).hover({ timeout });
         break;
-
       case 'press':
       case 'key':
         await page.keyboard.press(step.key || step.value);
         break;
-
       default:
         console.log(`      ⚠️ Unknown action: ${step.action}`);
     }
-
   } catch (error) {
     result.status = 'failed';
     result.error = error.message;
@@ -753,10 +663,6 @@ async function executeStep(page, step) {
 
   return result;
 }
-
-// ============================================================
-// LOCATOR HELPER
-// ============================================================
 
 function getLocator(page, step) {
   if (step.selector) return page.locator(step.selector);
@@ -768,29 +674,11 @@ function getLocator(page, step) {
   throw new Error('No valid locator provided');
 }
 
-// ============================================================
-// CALLBACK
-// ============================================================
-
 async function sendCallback(callbackUrl, payload) {
   console.log(`\n${'='.repeat(60)}`);
-  console.log(`📤 SENDING CALLBACK TO LOVABLE`);
+  console.log(`📤 CALLBACK PAYLOAD`);
   console.log(`${'='.repeat(60)}`);
-  console.log(`   URL: ${callbackUrl}`);
-  console.log(`   overall_status: ${payload.overall_status}`);
-  console.log(`   test_results: ${payload.test_results.length} test(s)`);
-  
-  // Count total steps
-  let totalSteps = 0;
-  payload.test_results.forEach(tr => {
-    totalSteps += tr.steps?.length || 0;
-  });
-  console.log(`   Total steps: ${totalSteps}`);
-  
-  // Log the full payload for debugging
-  console.log(`\n   📋 FULL CALLBACK PAYLOAD:`);
   console.log(JSON.stringify(payload, null, 2));
-  console.log(`${'='.repeat(60)}\n`);
 
   try {
     const response = await fetch(callbackUrl, {
@@ -802,40 +690,25 @@ async function sendCallback(callbackUrl, payload) {
     const responseText = await response.text();
     
     if (!response.ok) {
-      console.error(`   ❌ Callback failed: ${response.status}`);
-      console.error(`   Response: ${responseText}`);
+      console.error(`❌ Callback failed: ${response.status} - ${responseText}`);
     } else {
-      console.log(`   ✅ Callback sent successfully`);
+      console.log(`✅ Callback sent successfully`);
       console.log(`   Response: ${responseText}`);
     }
   } catch (error) {
-    console.error(`   ❌ Callback error: ${error.message}`);
+    console.error(`❌ Callback error: ${error.message}`);
   }
 }
-
-// ============================================================
-// START SERVER
-// ============================================================
 
 app.listen(PORT, () => {
   console.log(`
 ${'═'.repeat(60)}
-  🎭 Power Apps Regression Runner v2.7
-     WITH FULL PAYLOAD LOGGING
+  🎭 Power Apps Regression Runner v2.8
+     FIXED: test_case_id must be UUID or null
 ${'═'.repeat(60)}
 
   Port: ${PORT}
   Cloudinary: ${cloudinary ? '✓ Configured' : '❌ Not configured'}
-
-  Features:
-    ✓ Full incoming payload logging
-    ✓ Guaranteed steps (even if test has none)
-    ✓ All required fields (started_at, finished_at)
-    ✓ Navigation step always included
-
-  Endpoints:
-    GET  /health        - Health check
-    POST /webhook/run   - Execute test run
 
 ${'═'.repeat(60)}
   `);
