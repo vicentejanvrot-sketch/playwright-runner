@@ -1,9 +1,7 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.3
+ * Power Apps Regression Recorder - Runner Service v2.4
  * 
- * FIXES:
- * - Corrected Cloudinary signature calculation
- * - Improved video recording to ensure non-empty files
+ * Uses Cloudinary SDK for automatic signature handling
  */
 
 const express = require('express');
@@ -11,7 +9,6 @@ const { chromium } = require('playwright');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -23,9 +20,21 @@ const MAX_CONCURRENT_RUNS = parseInt(process.env.MAX_CONCURRENT_RUNS || '3');
 const ARTIFACTS_DIR = path.join(__dirname, '../artifacts');
 
 // Cloudinary Configuration
-const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
-const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
-const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+const CLOUDINARY_CLOUD_NAME = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
+const CLOUDINARY_API_KEY = (process.env.CLOUDINARY_API_KEY || '').trim();
+const CLOUDINARY_API_SECRET = (process.env.CLOUDINARY_API_SECRET || '').trim();
+
+// Initialize Cloudinary
+let cloudinary = null;
+if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
+  cloudinary = require('cloudinary').v2;
+  cloudinary.config({
+    cloud_name: CLOUDINARY_CLOUD_NAME,
+    api_key: CLOUDINARY_API_KEY,
+    api_secret: CLOUDINARY_API_SECRET
+  });
+  console.log('✓ Cloudinary SDK initialized');
+}
 
 // Ensure artifacts directory exists
 if (!fs.existsSync(ARTIFACTS_DIR)) {
@@ -37,86 +46,39 @@ let activeRuns = 0;
 const runQueue = [];
 
 // ============================================================
-// CLOUDINARY UPLOAD - FIXED SIGNATURE
+// CLOUDINARY UPLOAD - USING SDK
 // ============================================================
 
 async function uploadToCloudinary(filePath, publicId, resourceType = 'video') {
   console.log(`\n  📤 CLOUDINARY UPLOAD`);
   console.log(`     File: ${filePath}`);
   console.log(`     Public ID: ${publicId}`);
-  console.log(`     Type: ${resourceType}`);
 
-  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    console.log('  ❌ Cloudinary NOT configured!');
+  if (!cloudinary) {
+    console.log('  ❌ Cloudinary not configured!');
     return null;
   }
 
   if (!fs.existsSync(filePath)) {
-    console.log(`  ❌ File does not exist: ${filePath}`);
+    console.log(`  ❌ File does not exist`);
     return null;
   }
 
-  const fileStats = fs.statSync(filePath);
-  console.log(`     File size: ${(fileStats.size / 1024).toFixed(2)} KB`);
+  const stats = fs.statSync(filePath);
+  console.log(`     File size: ${(stats.size / 1024).toFixed(2)} KB`);
 
-  if (fileStats.size < 1000) {
-    console.log(`  ❌ File too small (likely empty recording)`);
+  if (stats.size < 1000) {
+    console.log(`  ❌ File too small`);
     return null;
   }
 
   try {
-    const timestamp = Math.floor(Date.now() / 1000);
-    
-    // FIXED: Signature must include parameters in alphabetical order
-    // Only include parameters that affect the upload
-    const paramsToSign = {
+    const result = await cloudinary.uploader.upload(filePath, {
+      resource_type: resourceType,
       public_id: publicId,
-      timestamp: timestamp
-    };
-    
-    // Sort parameters alphabetically and create signature string
-    const sortedParams = Object.keys(paramsToSign).sort();
-    const signatureBase = sortedParams
-      .map(key => `${key}=${paramsToSign[key]}`)
-      .join('&');
-    
-    const signatureString = signatureBase + CLOUDINARY_API_SECRET;
-    const signature = crypto.createHash('sha1').update(signatureString).digest('hex');
-    
-    console.log(`     Signature base: ${signatureBase}`);
-    console.log(`     Signature: ${signature.substring(0, 20)}...`);
-
-    // Read file
-    const fileBuffer = fs.readFileSync(filePath);
-    const base64File = fileBuffer.toString('base64');
-    const mimeType = resourceType === 'video' ? 'video/webm' : 'image/png';
-    const dataUri = `data:${mimeType};base64,${base64File}`;
-
-    // Build form data
-    const formData = new URLSearchParams();
-    formData.append('file', dataUri);
-    formData.append('public_id', publicId);
-    formData.append('timestamp', timestamp.toString());
-    formData.append('api_key', CLOUDINARY_API_KEY);
-    formData.append('signature', signature);
-
-    const uploadUrl = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`;
-    console.log(`     Uploading to: ${uploadUrl}`);
-    
-    const response = await fetch(uploadUrl, {
-      method: 'POST',
-      body: formData
+      overwrite: true
     });
 
-    const responseText = await response.text();
-    
-    if (!response.ok) {
-      console.error(`  ❌ Upload failed: ${response.status}`);
-      console.error(`     Response: ${responseText.substring(0, 200)}`);
-      return null;
-    }
-
-    const result = JSON.parse(responseText);
     console.log(`  ✅ Upload SUCCESS!`);
     console.log(`     URL: ${result.secure_url}`);
     return result.secure_url;
@@ -135,11 +97,11 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.3.0',
+    version: '2.4.0',
     activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
-    cloudinaryConfigured: !!(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET)
+    cloudinaryConfigured: !!cloudinary
   });
 });
 
@@ -324,7 +286,7 @@ async function executeRun(payload) {
       }
     }
 
-    // Add a small delay at the end to ensure video captures final state
+    // Add delay to ensure video captures final state
     console.log('⏳ Finalizing recording...');
     await page.waitForTimeout(2000);
 
@@ -387,9 +349,7 @@ async function executeRun(payload) {
         console.log(`📹 Video size: ${(stats.size / 1024).toFixed(2)} KB`);
 
         if (stats.size > 1000) {
-          // Use a simpler public_id without slashes to avoid signature issues
           const simpleId = `regression_${runId.replace(/-/g, '_')}`;
-          
           videoUrl = await uploadToCloudinary(videoPath, simpleId, 'video');
           results.replay_video_url = videoUrl;
         } else {
@@ -602,11 +562,12 @@ async function sendCallback(callbackUrl, payload) {
 app.listen(PORT, () => {
   console.log(`
 ${'═'.repeat(60)}
-  🎭 Power Apps Regression Runner v2.3
+  🎭 Power Apps Regression Runner v2.4
+     Using Cloudinary SDK
 ${'═'.repeat(60)}
 
   Port: ${PORT}
-  Cloudinary: ${CLOUDINARY_CLOUD_NAME ? '✓ Configured' : '❌ Not configured'}
+  Cloudinary: ${cloudinary ? '✓ Configured' : '❌ Not configured'}
 
   Endpoints:
     GET  /health        - Health check
