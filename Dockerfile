@@ -1,7 +1,7 @@
 # Power Apps Regression Runner v2.1
 # WITH VIDEO UPLOAD TO CLOUDINARY
 
-FROM mcr.microsoft.com/playwright:v1.40.0-jammy
+FROM mcr.microsoft.com/playwright:v1.50.0-jammy
 
 WORKDIR /app
 
