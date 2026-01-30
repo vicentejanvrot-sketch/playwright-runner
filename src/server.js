@@ -1,8 +1,7 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.9.2
+ * Power Apps Regression Recorder - Runner Service v2.9.3
  * 
- * FIX: Fetch steps from steps_json_url
- * ASCII-only version for compatibility
+ * ENHANCED DEBUGGING: Log full steps JSON to see Lovable's format
  */
 
 const express = require('express');
@@ -64,23 +63,124 @@ function isValidUUID(str) {
 }
 
 // ============================================================
-// HELPER: Fetch steps from URL
+// HELPER: Fetch steps from URL - WITH FULL DEBUG OUTPUT
 // ============================================================
 async function fetchStepsFromUrl(stepsJsonUrl) {
-  console.log('   [FETCH] Downloading steps from: ' + stepsJsonUrl);
+  console.log('\n   ============================================');
+  console.log('   [FETCH] DOWNLOADING STEPS');
+  console.log('   ============================================');
+  console.log('   URL: ' + stepsJsonUrl);
+  
   try {
     var response = await fetch(stepsJsonUrl);
+    console.log('   HTTP Status: ' + response.status);
+    
     if (!response.ok) {
       console.log('   [X] Failed to fetch steps: HTTP ' + response.status);
       return [];
     }
-    var steps = await response.json();
-    console.log('   [OK] Downloaded ' + steps.length + ' steps');
+    
+    var rawText = await response.text();
+    console.log('   Raw response length: ' + rawText.length + ' chars');
+    console.log('   Raw response (first 2000 chars):');
+    console.log('   ' + rawText.substring(0, 2000));
+    
+    var data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (parseError) {
+      console.log('   [X] JSON parse error: ' + parseError.message);
+      return [];
+    }
+    
+    console.log('\n   Parsed data type: ' + typeof data);
+    console.log('   Is array: ' + Array.isArray(data));
+    
+    // Handle different possible formats
+    var steps = [];
+    
+    if (Array.isArray(data)) {
+      steps = data;
+      console.log('   Format: Direct array of steps');
+    } else if (data && typeof data === 'object') {
+      // Check for nested structures
+      if (data.steps && Array.isArray(data.steps)) {
+        steps = data.steps;
+        console.log('   Format: Object with .steps array');
+      } else if (data.actions && Array.isArray(data.actions)) {
+        steps = data.actions;
+        console.log('   Format: Object with .actions array');
+      } else if (data.recording && Array.isArray(data.recording)) {
+        steps = data.recording;
+        console.log('   Format: Object with .recording array');
+      } else if (data.events && Array.isArray(data.events)) {
+        steps = data.events;
+        console.log('   Format: Object with .events array');
+      } else {
+        // Log all keys to understand structure
+        console.log('   Object keys: ' + Object.keys(data).join(', '));
+        console.log('   [!] Unknown format - trying to find steps array');
+        
+        // Try to find any array property
+        for (var key in data) {
+          if (Array.isArray(data[key]) && data[key].length > 0) {
+            steps = data[key];
+            console.log('   Found array in key: ' + key);
+            break;
+          }
+        }
+      }
+    }
+    
+    console.log('\n   [OK] Found ' + steps.length + ' steps');
+    
+    // Log each step structure
+    if (steps.length > 0) {
+      console.log('\n   STEP DETAILS:');
+      steps.forEach(function(step, idx) {
+        console.log('   ----------------------------------------');
+        console.log('   Step ' + idx + ':');
+        console.log('   ' + JSON.stringify(step, null, 2).split('\n').join('\n   '));
+      });
+    }
+    
     return steps;
+    
   } catch (error) {
     console.log('   [X] Error fetching steps: ' + error.message);
+    console.log('   Stack: ' + error.stack);
     return [];
   }
+}
+
+// ============================================================
+// HELPER: Normalize step to standard format
+// ============================================================
+function normalizeStep(step) {
+  // Try to extract action type from various possible fields
+  var action = step.action || step.type || step.actionType || step.event || step.command || 'unknown';
+  
+  // Try to extract selector/target from various possible fields
+  var selector = step.selector || step.target || step.element || step.locator || step.css || null;
+  var xpath = step.xpath || step.xPath || null;
+  var text = step.text || step.textContent || step.innerText || step.label || null;
+  var value = step.value || step.inputValue || step.text || null;
+  
+  // Handle coordinates if present
+  var x = step.x || (step.position && step.position.x) || (step.coordinates && step.coordinates.x) || null;
+  var y = step.y || (step.position && step.position.y) || (step.coordinates && step.coordinates.y) || null;
+  
+  return {
+    action: action.toLowerCase(),
+    selector: selector,
+    xpath: xpath,
+    text: text,
+    value: value,
+    x: x,
+    y: y,
+    timeout: step.timeout || 30000,
+    original: step // Keep original for reference
+  };
 }
 
 // ============================================================
@@ -140,7 +240,7 @@ app.get('/health', function(req, res) {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.9.2',
+    version: '2.9.3',
     activeRuns: activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
@@ -170,6 +270,9 @@ app.post('/webhook/run', async function(req, res) {
       var idType = isValidUUID(test.id) ? '[OK] UUID' : '[X] NOT UUID';
       var hasStepsUrl = test.steps_json_url ? '[OK] Has steps_json_url' : '[!] No steps_json_url';
       console.log('   Test ' + (idx + 1) + ': id="' + test.id + '" (' + idType + ') ' + hasStepsUrl);
+      if (test.steps_json_url) {
+        console.log('      steps_json_url: ' + test.steps_json_url);
+      }
     });
   }
   
@@ -383,14 +486,14 @@ async function executeRun(payload) {
     // Execute each test
     for (var t = 0; t < suite.tests.length; t++) {
       var test = suite.tests[t];
-      console.log('\n----------------------------------------');
+      console.log('\n========================================');
       console.log('[TEST] ' + test.name);
-      console.log('----------------------------------------');
+      console.log('========================================');
       
       var testCaseId = isValidUUID(test.id) ? test.id : null;
       console.log('   test_case_id: ' + testCaseId);
       
-      // CRITICAL FIX: Fetch steps from steps_json_url if provided
+      // FETCH STEPS FROM URL
       var testSteps = [];
       if (test.steps_json_url) {
         console.log('   [!] Found steps_json_url - fetching...');
@@ -399,7 +502,7 @@ async function executeRun(payload) {
         testSteps = test.steps;
         console.log('   [OK] Using inline steps: ' + testSteps.length);
       } else {
-        console.log('   [!] No steps found');
+        console.log('   [!] No steps source found');
       }
       
       var testResultSteps = [navigationStep];
@@ -444,14 +547,20 @@ async function executeRun(payload) {
         stepCounter++;
       } else {
         // Execute each step from the fetched steps
+        console.log('\n   EXECUTING ' + testSteps.length + ' STEPS:');
+        
         for (var i = 0; i < testSteps.length; i++) {
-          var step = testSteps[i];
+          var rawStep = testSteps[i];
+          var step = normalizeStep(rawStep);
           var stepStartTime = new Date().toISOString();
           
-          // Log step details
-          var stepAction = step.action || step.type || 'unknown';
-          var stepTarget = step.selector || step.control_name || step.text || step.target || 'unknown';
-          console.log('\n   Step ' + stepCounter + ': ' + stepAction + ' on ' + stepTarget);
+          console.log('\n   ----------------------------------------');
+          console.log('   Step ' + stepCounter + ' (index ' + i + ')');
+          console.log('   Raw: ' + JSON.stringify(rawStep));
+          console.log('   Normalized action: ' + step.action);
+          console.log('   Selector: ' + (step.selector || 'none'));
+          console.log('   Text: ' + (step.text || 'none'));
+          console.log('   Value: ' + (step.value || 'none'));
 
           // Take BEFORE screenshot
           var beforePath = path.join(runArtifactsDir, 'step_' + stepCounter + '_before.png');
@@ -488,10 +597,12 @@ async function executeRun(payload) {
           console.log('   screenshot_url: ' + (screenshotUrl || 'NULL'));
           console.log('   baseline_screenshot_url: ' + (baselineUrl || 'NULL'));
 
+          var targetSummary = step.selector || step.text || step.value || 'Unknown target';
+
           testResultSteps.push({
             step_index: stepCounter,
-            action_type: stepAction.toLowerCase(),
-            target_summary: step.name || step.description || getTargetSummary(step),
+            action_type: step.action,
+            target_summary: targetSummary,
             status: stepExecution.status,
             started_at: stepStartTime,
             finished_at: stepEndTime,
@@ -499,8 +610,8 @@ async function executeRun(payload) {
             baseline_screenshot_url: baselineUrl,
             visual_diff_score: stepExecution.status === 'passed' ? 100 : 0,
             assertion_evidence: [{
-              type: stepAction.toLowerCase(),
-              expected: getExpectedOutcome(step),
+              type: step.action,
+              expected: 'Action "' + step.action + '" should complete',
               actual: stepExecution.status === 'passed' 
                 ? 'Action completed successfully' 
                 : stepExecution.error,
@@ -514,7 +625,7 @@ async function executeRun(payload) {
             testStatus = 'failed';
             results.overall_status = 'failed';
             console.log('   [X] Failed: ' + stepExecution.error);
-            break;
+            // Continue to next step instead of breaking - capture all results
           } else {
             console.log('   [OK] Passed');
           }
@@ -697,48 +808,29 @@ async function executeRun(payload) {
   return results;
 }
 
-function getTargetSummary(step) {
-  if (step.selector) return 'Element: ' + step.selector;
-  if (step.control_name) return 'Control: ' + step.control_name;
-  if (step.text) return 'Text: "' + step.text + '"';
-  if (step.aria_label) return 'Label: ' + step.aria_label;
-  if (step.target) return step.target;
-  if (step.url || step.value) return step.url || step.value;
-  return 'Unknown target';
-}
-
-function getExpectedOutcome(step) {
-  var action = step.action || step.type || '';
-  action = action.toLowerCase();
-  switch (action) {
-    case 'click': return 'Click on element should succeed';
-    case 'fill':
-    case 'type':
-    case 'input': return 'Input value "' + (step.value || '') + '" should be entered';
-    case 'select':
-    case 'dropdown': return 'Option "' + (step.value || '') + '" should be selected';
-    case 'wait': return 'Element should become ' + (step.state || 'visible');
-    case 'assert':
-    case 'verify': return 'Element should be ' + (step.type || 'visible');
-    case 'navigate':
-    case 'goto': return 'Page should navigate successfully';
-    default: return 'Action "' + action + '" should complete';
-  }
-}
-
 async function executeStep(page, step) {
   var result = { status: 'passed', error: null };
   var timeout = step.timeout || 30000;
 
   try {
-    var action = step.action || step.type || '';
-    action = action.toLowerCase();
+    var action = step.action || 'unknown';
+    
+    console.log('   Executing action: ' + action);
     
     switch (action) {
       case 'click':
-        await getLocator(page, step).click({ timeout: timeout });
+        if (step.x && step.y) {
+          // Click by coordinates
+          console.log('      Clicking at coordinates: ' + step.x + ', ' + step.y);
+          await page.mouse.click(step.x, step.y);
+        } else if (step.selector || step.xpath || step.text) {
+          await getLocator(page, step).click({ timeout: timeout });
+        } else {
+          console.log('      [!] No target for click - skipping');
+        }
         await page.waitForTimeout(500);
         break;
+        
       case 'fill':
       case 'type':
       case 'input':
@@ -748,6 +840,7 @@ async function executeStep(page, step) {
         }
         await loc.fill(step.value || '', { timeout: timeout });
         break;
+        
       case 'select':
       case 'dropdown':
         try {
@@ -755,35 +848,46 @@ async function executeStep(page, step) {
         } catch (e) {
           await getLocator(page, step).click({ timeout: timeout });
           await page.waitForTimeout(500);
-          await page.getByText(step.value, { exact: step.exact }).click({ timeout: timeout });
+          await page.getByText(step.value, { exact: false }).click({ timeout: timeout });
         }
         break;
+        
       case 'wait':
         if (step.selector) {
           await page.waitForSelector(step.selector, { state: step.state || 'visible', timeout: timeout });
-        } else if (step.duration || step.value) {
-          await page.waitForTimeout(parseInt(step.duration || step.value));
+        } else if (step.value) {
+          await page.waitForTimeout(parseInt(step.value));
         } else {
           await page.waitForLoadState('networkidle', { timeout: timeout });
         }
         break;
+        
       case 'assert':
       case 'verify':
-        var state = step.state || step.type || 'visible';
+        var state = step.state || 'visible';
         await getLocator(page, step).waitFor({ state: state, timeout: timeout });
         break;
+        
       case 'navigate':
       case 'goto':
-        await page.goto(step.url || step.value, { waitUntil: 'load', timeout: timeout });
+        await page.goto(step.value || step.url, { waitUntil: 'load', timeout: timeout });
         await page.waitForTimeout(2000);
         break;
+        
       case 'hover':
-        await getLocator(page, step).hover({ timeout: timeout });
+        if (step.x && step.y) {
+          await page.mouse.move(step.x, step.y);
+        } else {
+          await getLocator(page, step).hover({ timeout: timeout });
+        }
         break;
+        
       case 'press':
       case 'key':
-        await page.keyboard.press(step.key || step.value);
+      case 'keypress':
+        await page.keyboard.press(step.value || step.key);
         break;
+        
       case 'scroll':
         if (step.selector) {
           await getLocator(page, step).scrollIntoViewIfNeeded();
@@ -791,12 +895,14 @@ async function executeStep(page, step) {
           await page.mouse.wheel(0, step.y || 300);
         }
         break;
+        
       default:
-        console.log('      [!] Unknown action: ' + action + ' - skipping');
+        console.log('      [!] Unknown action: ' + action + ' - taking screenshot only');
     }
   } catch (error) {
     result.status = 'failed';
     result.error = error.message;
+    console.log('      [X] Error: ' + error.message);
   }
 
   return result;
@@ -804,18 +910,26 @@ async function executeStep(page, step) {
 
 function getLocator(page, step) {
   // Try multiple locator strategies
-  if (step.selector) return page.locator(step.selector);
-  if (step.control_name) return page.locator('[data-control-name="' + step.control_name + '"]');
-  if (step.xpath) return page.locator('xpath=' + step.xpath);
-  if (step.text) return page.getByText(step.text, { exact: step.exact !== false });
-  if (step.aria_label || step.label) return page.getByLabel(step.aria_label || step.label);
-  if (step.placeholder) return page.getByPlaceholder(step.placeholder);
-  if (step.role) return page.getByRole(step.role, { name: step.name });
-  if (step.testId || step.test_id) return page.getByTestId(step.testId || step.test_id);
-  if (step.target) {
-    // Try to parse target as a selector
-    if (step.target.startsWith('//')) return page.locator('xpath=' + step.target);
-    return page.locator(step.target);
+  if (step.selector) {
+    console.log('      Using selector: ' + step.selector);
+    return page.locator(step.selector);
+  }
+  if (step.xpath) {
+    console.log('      Using xpath: ' + step.xpath);
+    return page.locator('xpath=' + step.xpath);
+  }
+  if (step.text) {
+    console.log('      Using text: ' + step.text);
+    return page.getByText(step.text, { exact: false });
+  }
+  if (step.original) {
+    // Check original step for more options
+    var orig = step.original;
+    if (orig.control_name) return page.locator('[data-control-name="' + orig.control_name + '"]');
+    if (orig.aria_label || orig.label) return page.getByLabel(orig.aria_label || orig.label);
+    if (orig.placeholder) return page.getByPlaceholder(orig.placeholder);
+    if (orig.role) return page.getByRole(orig.role, { name: orig.name });
+    if (orig.testId || orig.test_id) return page.getByTestId(orig.testId || orig.test_id);
   }
   throw new Error('No valid locator provided for step');
 }
@@ -848,8 +962,8 @@ async function sendCallback(callbackUrl, payload) {
 
 app.listen(PORT, function() {
   console.log('\n============================================================');
-  console.log('  Power Apps Regression Runner v2.9.2');
-  console.log('  NOW FETCHES STEPS FROM steps_json_url');
+  console.log('  Power Apps Regression Runner v2.9.3');
+  console.log('  ENHANCED DEBUG - Full steps JSON logging');
   console.log('============================================================');
   console.log('');
   console.log('  Port: ' + PORT);
