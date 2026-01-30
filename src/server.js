@@ -1,7 +1,7 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.8
+ * Power Apps Regression Recorder - Runner Service v2.9
  * 
- * FIXED: test_case_id must be UUID or null
+ * ENHANCED CLOUDINARY LOGGING
  */
 
 const express = require('express');
@@ -24,6 +24,12 @@ const CLOUDINARY_CLOUD_NAME = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
 const CLOUDINARY_API_KEY = (process.env.CLOUDINARY_API_KEY || '').trim();
 const CLOUDINARY_API_SECRET = (process.env.CLOUDINARY_API_SECRET || '').trim();
 
+// Log Cloudinary config status at startup
+console.log('\n📷 CLOUDINARY CONFIGURATION:');
+console.log(`   CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME ? `"${CLOUDINARY_CLOUD_NAME}"` : '❌ NOT SET'}`);
+console.log(`   CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY ? `"${CLOUDINARY_API_KEY.substring(0, 4)}..."` : '❌ NOT SET'}`);
+console.log(`   CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET ? '"***" (hidden)' : '❌ NOT SET'}`);
+
 // Initialize Cloudinary
 let cloudinary = null;
 if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
@@ -33,7 +39,9 @@ if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
     api_key: CLOUDINARY_API_KEY,
     api_secret: CLOUDINARY_API_SECRET
   });
-  console.log('✓ Cloudinary SDK initialized');
+  console.log('   ✅ Cloudinary SDK initialized successfully\n');
+} else {
+  console.log('   ❌ Cloudinary NOT initialized - missing environment variables\n');
 }
 
 // Ensure artifacts directory exists
@@ -55,33 +63,48 @@ function isValidUUID(str) {
 }
 
 // ============================================================
-// CLOUDINARY UPLOAD
+// CLOUDINARY UPLOAD - WITH DETAILED LOGGING
 // ============================================================
 
 async function uploadToCloudinary(filePath, publicId, resourceType = 'image') {
+  console.log(`\n   📤 UPLOAD ATTEMPT:`);
+  console.log(`      File: ${filePath}`);
+  console.log(`      Public ID: ${publicId}`);
+  console.log(`      Type: ${resourceType}`);
+  
   if (!cloudinary) {
+    console.log(`      ❌ FAILED: Cloudinary not configured`);
     return null;
   }
 
   if (!fs.existsSync(filePath)) {
+    console.log(`      ❌ FAILED: File does not exist`);
     return null;
   }
 
   const stats = fs.statSync(filePath);
+  console.log(`      File size: ${(stats.size / 1024).toFixed(2)} KB`);
+  
   if (stats.size < 100) {
+    console.log(`      ❌ FAILED: File too small (< 100 bytes)`);
     return null;
   }
 
   try {
+    console.log(`      ⏳ Uploading to Cloudinary...`);
     const result = await cloudinary.uploader.upload(filePath, {
       resource_type: resourceType,
       public_id: publicId,
       overwrite: true
     });
-    console.log(`  ✓ Uploaded: ${publicId}`);
+    console.log(`      ✅ SUCCESS!`);
+    console.log(`      URL: ${result.secure_url}`);
     return result.secure_url;
   } catch (error) {
-    console.error(`  ✗ Upload failed: ${error.message}`);
+    console.log(`      ❌ FAILED: ${error.message}`);
+    if (error.http_code) {
+      console.log(`      HTTP Code: ${error.http_code}`);
+    }
     return null;
   }
 }
@@ -94,11 +117,12 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.8.0',
+    version: '2.9.0',
     activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
-    cloudinaryConfigured: !!cloudinary
+    cloudinaryConfigured: !!cloudinary,
+    cloudinaryCloudName: CLOUDINARY_CLOUD_NAME || null
   });
 });
 
@@ -118,7 +142,6 @@ app.post('/webhook/run', async (req, res) => {
   console.log(`\n   Run ID: ${payload.runId}`);
   console.log(`   Tests: ${payload.suite?.tests?.length || 0}`);
   
-  // Log test IDs to verify they're UUIDs
   if (payload.suite?.tests) {
     payload.suite.tests.forEach((test, idx) => {
       const idType = isValidUUID(test.id) ? '✓ UUID' : '✗ NOT UUID';
@@ -185,7 +208,7 @@ async function processQueue() {
       replay_video_url: null,
       error_message: error.message,
       test_results: [{
-        test_case_id: null,  // Use null instead of string
+        test_case_id: null,
         steps: [{
           step_index: 0,
           action_type: 'initialize',
@@ -193,6 +216,7 @@ async function processQueue() {
           status: 'failed',
           started_at: now,
           finished_at: now,
+          screenshot_url: null,
           assertion_evidence: [{
             type: 'error',
             expected: 'Runner to start successfully',
@@ -218,6 +242,7 @@ async function executeRun(payload) {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`🚀 STARTING RUN: ${runId}`);
   console.log(`${'='.repeat(60)}`);
+  console.log(`\n📷 Cloudinary Status: ${cloudinary ? '✅ READY' : '❌ NOT CONFIGURED'}`);
   
   const startTime = Date.now();
   const runIdClean = runId.replace(/-/g, '_');
@@ -228,6 +253,7 @@ async function executeRun(payload) {
     fs.rmSync(runArtifactsDir, { recursive: true, force: true });
   }
   fs.mkdirSync(runArtifactsDir, { recursive: true });
+  console.log(`📁 Artifacts directory: ${runArtifactsDir}`);
 
   const shouldRecordVideo = artifacts?.recordVideo !== false;
   
@@ -262,11 +288,14 @@ async function executeRun(payload) {
   };
 
   let stepCounter = 0;
+  
+  // Track all screenshot URLs for summary
+  const uploadedScreenshots = [];
 
   try {
     // Navigate to Power Apps URL
     const navStartTime = new Date().toISOString();
-    console.log(`📍 Navigating to: ${environment.powerapps_url}`);
+    console.log(`\n📍 Navigating to: ${environment.powerapps_url}`);
     
     await page.goto(environment.powerapps_url, { 
       waitUntil: 'load',
@@ -287,17 +316,33 @@ async function executeRun(payload) {
     console.log('✓ Page ready');
 
     // Take navigation screenshot
+    console.log('\n📸 Taking navigation screenshot...');
     const navScreenshotPath = path.join(runArtifactsDir, `step_${stepCounter}_nav.png`);
     await page.screenshot({ path: navScreenshotPath });
+    console.log(`   Saved to: ${navScreenshotPath}`);
+    
+    // Verify file was created
+    if (fs.existsSync(navScreenshotPath)) {
+      const stats = fs.statSync(navScreenshotPath);
+      console.log(`   File exists: ${(stats.size / 1024).toFixed(2)} KB`);
+    } else {
+      console.log(`   ❌ File was NOT created!`);
+    }
+    
     const navEndTime = new Date().toISOString();
     
+    // Upload navigation screenshot
     const navScreenshotUrl = await uploadToCloudinary(
       navScreenshotPath,
       `run_${runIdClean}_step_${stepCounter}_nav`,
       'image'
     );
+    
+    if (navScreenshotUrl) {
+      uploadedScreenshots.push(navScreenshotUrl);
+    }
 
-    // Navigation step (will be added to each test)
+    // Navigation step
     const navigationStep = {
       step_index: stepCounter,
       action_type: 'navigate',
@@ -314,33 +359,47 @@ async function executeRun(payload) {
       }]
     };
     
+    console.log(`\n   Step ${stepCounter} screenshot_url: ${navScreenshotUrl || 'NULL'}`);
+    
     stepCounter++;
 
     // Execute each test
     for (const test of suite.tests) {
-      console.log(`\n📋 Test: ${test.name}`);
+      console.log(`\n${'─'.repeat(40)}`);
+      console.log(`📋 Test: ${test.name}`);
+      console.log(`${'─'.repeat(40)}`);
       
-      // CRITICAL: Use the UUID from Lovable, or null if not a valid UUID
       const testCaseId = isValidUUID(test.id) ? test.id : null;
-      console.log(`   test_case_id: ${testCaseId} (from test.id: "${test.id}")`);
+      console.log(`   test_case_id: ${testCaseId}`);
       
       const testSteps = test.steps || [];
       const testResultSteps = [navigationStep];
       let testStatus = 'passed';
 
       if (testSteps.length === 0) {
-        console.log(`   ⚠️ No steps, creating verification step`);
+        console.log(`   ⚠️ No steps in test, creating verification step`);
         
         const verifyStartTime = new Date().toISOString();
+        
+        // Take verification screenshot
+        console.log('\n📸 Taking verification screenshot...');
         const verifyPath = path.join(runArtifactsDir, `step_${stepCounter}_verify.png`);
         await page.screenshot({ path: verifyPath });
+        
         const verifyEndTime = new Date().toISOString();
         
+        // Upload verification screenshot
         const verifyUrl = await uploadToCloudinary(
           verifyPath,
           `run_${runIdClean}_step_${stepCounter}_verify`,
           'image'
         );
+        
+        if (verifyUrl) {
+          uploadedScreenshots.push(verifyUrl);
+        }
+        
+        console.log(`   Step ${stepCounter} screenshot_url: ${verifyUrl || 'NULL'}`);
         
         testResultSteps.push({
           step_index: stepCounter,
@@ -364,29 +423,42 @@ async function executeRun(payload) {
           const step = testSteps[i];
           const stepStartTime = new Date().toISOString();
           
-          console.log(`    Step ${i}: ${step.action}`);
+          console.log(`\n   Step ${stepCounter}: ${step.action}`);
 
+          // Take BEFORE screenshot
           const beforePath = path.join(runArtifactsDir, `step_${stepCounter}_before.png`);
           await page.screenshot({ path: beforePath });
 
+          // Execute the step
           const stepExecution = await executeStep(page, step);
 
+          // Take AFTER screenshot
+          console.log(`   📸 Taking step screenshot...`);
           const afterPath = path.join(runArtifactsDir, `step_${stepCounter}_after.png`);
           await page.screenshot({ path: afterPath });
           
           const stepEndTime = new Date().toISOString();
 
+          // Upload AFTER screenshot (main screenshot)
           const screenshotUrl = await uploadToCloudinary(
             afterPath,
             `run_${runIdClean}_step_${stepCounter}`,
             'image'
           );
           
+          if (screenshotUrl) {
+            uploadedScreenshots.push(screenshotUrl);
+          }
+          
+          // Upload BEFORE screenshot (baseline)
           const baselineUrl = await uploadToCloudinary(
             beforePath,
             `run_${runIdClean}_step_${stepCounter}_baseline`,
             'image'
           );
+
+          console.log(`   screenshot_url: ${screenshotUrl || 'NULL'}`);
+          console.log(`   baseline_screenshot_url: ${baselineUrl || 'NULL'}`);
 
           testResultSteps.push({
             step_index: stepCounter,
@@ -413,15 +485,14 @@ async function executeRun(payload) {
           if (stepExecution.status === 'failed') {
             testStatus = 'failed';
             results.overall_status = 'failed';
-            console.log(`    ✗ Failed: ${stepExecution.error}`);
+            console.log(`   ✗ Failed: ${stepExecution.error}`);
             break;
           } else {
-            console.log(`    ✓ Passed`);
+            console.log(`   ✓ Passed`);
           }
         }
       }
 
-      // CRITICAL: test_case_id is UUID or null
       results.test_results.push({
         test_case_id: testCaseId,
         status: testStatus,
@@ -429,7 +500,7 @@ async function executeRun(payload) {
       });
     }
 
-    // If no tests, create default with null test_case_id
+    // If no tests, create default
     if (results.test_results.length === 0) {
       const defaultStartTime = new Date().toISOString();
       const defaultPath = path.join(runArtifactsDir, `step_${stepCounter}_default.png`);
@@ -442,8 +513,12 @@ async function executeRun(payload) {
         'image'
       );
       
+      if (defaultUrl) {
+        uploadedScreenshots.push(defaultUrl);
+      }
+      
       results.test_results.push({
-        test_case_id: null,  // null, not a string
+        test_case_id: null,
         status: 'passed',
         steps: [
           navigationStep,
@@ -469,7 +544,7 @@ async function executeRun(payload) {
     await page.waitForTimeout(2000);
 
   } catch (error) {
-    console.error(`❌ Execution error: ${error.message}`);
+    console.error(`\n❌ Execution error: ${error.message}`);
     results.overall_status = 'failed';
     results.error_message = error.message;
     
@@ -488,7 +563,7 @@ async function executeRun(payload) {
     
     if (results.test_results.length === 0) {
       results.test_results.push({
-        test_case_id: null,  // null, not a string
+        test_case_id: null,
         status: 'failed',
         steps: [{
           step_index: 0,
@@ -510,7 +585,9 @@ async function executeRun(payload) {
   }
 
   // Video capture
-  console.log(`\n📹 Processing video...`);
+  console.log(`\n${'─'.repeat(40)}`);
+  console.log(`📹 PROCESSING VIDEO`);
+  console.log(`${'─'.repeat(40)}`);
 
   if (shouldRecordVideo) {
     try {
@@ -519,17 +596,23 @@ async function executeRun(payload) {
       
       if (video) {
         videoPath = await video.path();
+        console.log(`   Video path from API: ${videoPath}`);
       }
 
       await page.close();
       await context.close();
+      
+      console.log(`   Waiting for video file to finalize...`);
       await new Promise(resolve => setTimeout(resolve, 3000));
 
       if (!videoPath || !fs.existsSync(videoPath)) {
+        console.log(`   Looking for video files in: ${runArtifactsDir}`);
         const files = fs.readdirSync(runArtifactsDir);
+        console.log(`   Files found: ${files.join(', ')}`);
         const videoFiles = files.filter(f => f.endsWith('.webm'));
         if (videoFiles.length > 0) {
           videoPath = path.join(runArtifactsDir, videoFiles[0]);
+          console.log(`   Found video: ${videoPath}`);
         }
       }
 
@@ -544,7 +627,11 @@ async function executeRun(payload) {
             'video'
           );
           results.replay_video_url = videoUrl;
+        } else {
+          console.log(`   ⚠️ Video too small, skipping upload`);
         }
+      } else {
+        console.log(`   ⚠️ No video file found`);
       }
     } catch (videoError) {
       console.error(`   Video error: ${videoError.message}`);
@@ -559,16 +646,25 @@ async function executeRun(payload) {
 
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
   
+  // Summary
   console.log(`\n${'='.repeat(60)}`);
   console.log(`✅ RUN COMPLETED`);
   console.log(`${'='.repeat(60)}`);
   console.log(`   Status: ${results.overall_status}`);
   console.log(`   Duration: ${duration}s`);
   console.log(`   Tests: ${results.test_results.length}`);
+  console.log(`   Screenshots uploaded: ${uploadedScreenshots.length}`);
+  console.log(`   Video URL: ${results.replay_video_url || 'NONE'}`);
   
-  results.test_results.forEach((tr, idx) => {
-    console.log(`   Test ${idx + 1}: test_case_id=${tr.test_case_id}, steps=${tr.steps?.length}`);
-  });
+  if (uploadedScreenshots.length > 0) {
+    console.log(`\n   📸 Screenshot URLs:`);
+    uploadedScreenshots.forEach((url, idx) => {
+      console.log(`      ${idx + 1}. ${url}`);
+    });
+  } else {
+    console.log(`\n   ⚠️ NO SCREENSHOTS WERE UPLOADED!`);
+    console.log(`   Check Cloudinary configuration above.`);
+  }
 
   await sendCallback(callbackUrl, results);
   return results;
@@ -690,28 +786,66 @@ async function sendCallback(callbackUrl, payload) {
     const responseText = await response.text();
     
     if (!response.ok) {
-      console.error(`❌ Callback failed: ${response.status} - ${responseText}`);
+      console.error(`\n❌ Callback failed: ${response.status} - ${responseText}`);
     } else {
-      console.log(`✅ Callback sent successfully`);
+      console.log(`\n✅ Callback sent successfully`);
       console.log(`   Response: ${responseText}`);
     }
   } catch (error) {
-    console.error(`❌ Callback error: ${error.message}`);
+    console.error(`\n❌ Callback error: ${error.message}`);
   }
 }
 
 app.listen(PORT, () => {
   console.log(`
 ${'═'.repeat(60)}
-  🎭 Power Apps Regression Runner v2.8
-     FIXED: test_case_id must be UUID or null
+  🎭 Power Apps Regression Runner v2.9
+     ENHANCED CLOUDINARY LOGGING
 ${'═'.repeat(60)}
 
   Port: ${PORT}
-  Cloudinary: ${cloudinary ? '✓ Configured' : '❌ Not configured'}
+  Cloudinary: ${cloudinary ? '✅ READY' : '❌ NOT CONFIGURED'}
 
 ${'═'.repeat(60)}
   `);
 });
 
 module.exports = app;
+```
+
+---
+
+## What v2.9 adds:
+
+| Enhancement | Description |
+|------------|-------------|
+| **Startup logging** | Shows Cloudinary env vars status at boot |
+| **Upload logging** | Detailed logs for every upload attempt |
+| **Screenshot tracking** | Lists all uploaded screenshot URLs |
+| **File verification** | Confirms screenshot files exist before upload |
+| **Summary** | Shows total screenshots uploaded at end |
+
+---
+
+## After deploying, check the Render logs for:
+
+1. **At startup:**
+```
+📷 CLOUDINARY CONFIGURATION:
+   CLOUDINARY_CLOUD_NAME: "your-cloud-name"
+   CLOUDINARY_API_KEY: "1234..."
+   CLOUDINARY_API_SECRET: "***" (hidden)
+   ✅ Cloudinary SDK initialized successfully
+```
+
+2. **During test run:**
+```
+📸 Taking navigation screenshot...
+   Saved to: /app/artifacts/xxx/step_0_nav.png
+   File exists: 45.23 KB
+
+📤 UPLOAD ATTEMPT:
+   File: /app/artifacts/xxx/step_0_nav.png
+   ⏳ Uploading to Cloudinary...
+   ✅ SUCCESS!
+   URL: https://res.cloudinary.com/xxx/image/upload/run_xxx_step_0_nav.png
