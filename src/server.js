@@ -1,7 +1,10 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.9.3
+ * Power Apps Regression Recorder - Runner Service v2.9.4
  * 
- * ENHANCED DEBUGGING: Log full steps JSON to see Lovable's format
+ * MATCHES LOVABLE'S EXACT STEP FORMAT:
+ * - step.type: 'click' | 'input' | 'navigate' | 'scroll' | 'keydown' | 'wait'
+ * - step.data.targetHints: { ariaLabel, role, visibleText, cssPath, boundingBox }
+ * - step.data.value, step.data.url, step.data.key, step.data.duration
  */
 
 const express = require('express');
@@ -63,13 +66,10 @@ function isValidUUID(str) {
 }
 
 // ============================================================
-// HELPER: Fetch steps from URL - WITH FULL DEBUG OUTPUT
+// HELPER: Fetch steps from URL
 // ============================================================
 async function fetchStepsFromUrl(stepsJsonUrl) {
-  console.log('\n   ============================================');
-  console.log('   [FETCH] DOWNLOADING STEPS');
-  console.log('   ============================================');
-  console.log('   URL: ' + stepsJsonUrl);
+  console.log('\n   [FETCH] Downloading steps from: ' + stepsJsonUrl);
   
   try {
     var response = await fetch(stepsJsonUrl);
@@ -80,107 +80,127 @@ async function fetchStepsFromUrl(stepsJsonUrl) {
       return [];
     }
     
-    var rawText = await response.text();
-    console.log('   Raw response length: ' + rawText.length + ' chars');
-    console.log('   Raw response (first 2000 chars):');
-    console.log('   ' + rawText.substring(0, 2000));
+    var stepsData = await response.json();
     
-    var data;
-    try {
-      data = JSON.parse(rawText);
-    } catch (parseError) {
-      console.log('   [X] JSON parse error: ' + parseError.message);
+    // Handle both formats: direct array or { steps: [...] }
+    var steps = [];
+    if (Array.isArray(stepsData)) {
+      steps = stepsData;
+      console.log('   Format: Direct array');
+    } else if (stepsData && stepsData.steps && Array.isArray(stepsData.steps)) {
+      steps = stepsData.steps;
+      console.log('   Format: Object with .steps array');
+    } else {
+      console.log('   [!] Unknown format, keys: ' + Object.keys(stepsData || {}).join(', '));
       return [];
     }
     
-    console.log('\n   Parsed data type: ' + typeof data);
-    console.log('   Is array: ' + Array.isArray(data));
+    console.log('   [OK] Loaded ' + steps.length + ' steps to execute');
     
-    // Handle different possible formats
-    var steps = [];
-    
-    if (Array.isArray(data)) {
-      steps = data;
-      console.log('   Format: Direct array of steps');
-    } else if (data && typeof data === 'object') {
-      // Check for nested structures
-      if (data.steps && Array.isArray(data.steps)) {
-        steps = data.steps;
-        console.log('   Format: Object with .steps array');
-      } else if (data.actions && Array.isArray(data.actions)) {
-        steps = data.actions;
-        console.log('   Format: Object with .actions array');
-      } else if (data.recording && Array.isArray(data.recording)) {
-        steps = data.recording;
-        console.log('   Format: Object with .recording array');
-      } else if (data.events && Array.isArray(data.events)) {
-        steps = data.events;
-        console.log('   Format: Object with .events array');
-      } else {
-        // Log all keys to understand structure
-        console.log('   Object keys: ' + Object.keys(data).join(', '));
-        console.log('   [!] Unknown format - trying to find steps array');
-        
-        // Try to find any array property
-        for (var key in data) {
-          if (Array.isArray(data[key]) && data[key].length > 0) {
-            steps = data[key];
-            console.log('   Found array in key: ' + key);
-            break;
-          }
-        }
-      }
-    }
-    
-    console.log('\n   [OK] Found ' + steps.length + ' steps');
-    
-    // Log each step structure
-    if (steps.length > 0) {
-      console.log('\n   STEP DETAILS:');
-      steps.forEach(function(step, idx) {
-        console.log('   ----------------------------------------');
-        console.log('   Step ' + idx + ':');
-        console.log('   ' + JSON.stringify(step, null, 2).split('\n').join('\n   '));
-      });
-    }
+    // Log first few steps for debugging
+    steps.slice(0, 3).forEach(function(step, idx) {
+      console.log('   Step ' + idx + ': type=' + step.type + ', data=' + JSON.stringify(step.data || {}).substring(0, 100));
+    });
     
     return steps;
     
   } catch (error) {
     console.log('   [X] Error fetching steps: ' + error.message);
-    console.log('   Stack: ' + error.stack);
     return [];
   }
 }
 
 // ============================================================
-// HELPER: Normalize step to standard format
+// HELPER: Find element using multi-hint targeting (Lovable format)
+// Priority: ARIA label -> Role+Text -> CSS Path -> BoundingBox
 // ============================================================
-function normalizeStep(step) {
-  // Try to extract action type from various possible fields
-  var action = step.action || step.type || step.actionType || step.event || step.command || 'unknown';
+async function findElement(page, targetHints, timeout) {
+  timeout = timeout || 30000;
   
-  // Try to extract selector/target from various possible fields
-  var selector = step.selector || step.target || step.element || step.locator || step.css || null;
-  var xpath = step.xpath || step.xPath || null;
-  var text = step.text || step.textContent || step.innerText || step.label || null;
-  var value = step.value || step.inputValue || step.text || null;
+  if (!targetHints) {
+    throw new Error('No target hints provided');
+  }
   
-  // Handle coordinates if present
-  var x = step.x || (step.position && step.position.x) || (step.coordinates && step.coordinates.x) || null;
-  var y = step.y || (step.position && step.position.y) || (step.coordinates && step.coordinates.y) || null;
+  console.log('      Target hints: ' + JSON.stringify(targetHints));
   
-  return {
-    action: action.toLowerCase(),
-    selector: selector,
-    xpath: xpath,
-    text: text,
-    value: value,
-    x: x,
-    y: y,
-    timeout: step.timeout || 30000,
-    original: step // Keep original for reference
-  };
+  // Priority 1: ARIA label
+  if (targetHints.ariaLabel) {
+    try {
+      console.log('      Trying aria-label: ' + targetHints.ariaLabel);
+      var ariaLocator = page.locator('[aria-label="' + targetHints.ariaLabel + '"]').first();
+      await ariaLocator.waitFor({ state: 'visible', timeout: 5000 });
+      console.log('      [OK] Found by aria-label');
+      return ariaLocator;
+    } catch (e) {
+      console.log('      [!] aria-label not found, trying next...');
+    }
+  }
+  
+  // Priority 2: Role + visible text
+  if (targetHints.role && targetHints.visibleText) {
+    try {
+      console.log('      Trying role=' + targetHints.role + ' with text="' + targetHints.visibleText + '"');
+      var roleLocator = page.getByRole(targetHints.role, { name: targetHints.visibleText }).first();
+      await roleLocator.waitFor({ state: 'visible', timeout: 5000 });
+      console.log('      [OK] Found by role+text');
+      return roleLocator;
+    } catch (e) {
+      console.log('      [!] role+text not found, trying next...');
+    }
+  }
+  
+  // Priority 3: Visible text only
+  if (targetHints.visibleText) {
+    try {
+      console.log('      Trying visible text: ' + targetHints.visibleText);
+      var textLocator = page.getByText(targetHints.visibleText, { exact: false }).first();
+      await textLocator.waitFor({ state: 'visible', timeout: 5000 });
+      console.log('      [OK] Found by text');
+      return textLocator;
+    } catch (e) {
+      console.log('      [!] text not found, trying next...');
+    }
+  }
+  
+  // Priority 4: CSS path
+  if (targetHints.cssPath) {
+    try {
+      console.log('      Trying CSS path: ' + targetHints.cssPath);
+      var cssLocator = page.locator(targetHints.cssPath).first();
+      await cssLocator.waitFor({ state: 'visible', timeout: 5000 });
+      console.log('      [OK] Found by CSS path');
+      return cssLocator;
+    } catch (e) {
+      console.log('      [!] CSS path not found, trying next...');
+    }
+  }
+  
+  // Priority 5: Bounding box (click at coordinates)
+  if (targetHints.boundingBox) {
+    var box = targetHints.boundingBox;
+    console.log('      Using bounding box fallback: x=' + box.x + ', y=' + box.y);
+    // Return a special marker that executeStep will handle
+    return { _useBoundingBox: true, x: box.x + (box.width / 2), y: box.y + (box.height / 2) };
+  }
+  
+  throw new Error('Could not locate element with provided hints');
+}
+
+// ============================================================
+// HELPER: Get target summary for logging
+// ============================================================
+function getTargetSummary(step) {
+  if (step.type === 'navigate') {
+    return step.data && step.data.url ? step.data.url : 'Unknown URL';
+  }
+  if (step.data && step.data.targetHints) {
+    if (step.data.targetHints.visibleText) return step.data.targetHints.visibleText;
+    if (step.data.targetHints.ariaLabel) return step.data.targetHints.ariaLabel;
+    if (step.data.targetHints.cssPath) return step.data.targetHints.cssPath;
+  }
+  if (step.data && step.data.value) return 'Input: ' + step.data.value;
+  if (step.data && step.data.key) return 'Key: ' + step.data.key;
+  return 'Unknown target';
 }
 
 // ============================================================
@@ -193,7 +213,6 @@ async function uploadToCloudinary(filePath, publicId, resourceType) {
   console.log('\n   [UPLOAD] ATTEMPT:');
   console.log('      File: ' + filePath);
   console.log('      Public ID: ' + publicId);
-  console.log('      Type: ' + resourceType);
   
   if (!cloudinary) {
     console.log('      [X] FAILED: Cloudinary not configured');
@@ -209,25 +228,21 @@ async function uploadToCloudinary(filePath, publicId, resourceType) {
   console.log('      File size: ' + (stats.size / 1024).toFixed(2) + ' KB');
   
   if (stats.size < 100) {
-    console.log('      [X] FAILED: File too small (< 100 bytes)');
+    console.log('      [X] FAILED: File too small');
     return null;
   }
 
   try {
-    console.log('      [..] Uploading to Cloudinary...');
+    console.log('      [..] Uploading...');
     var result = await cloudinary.uploader.upload(filePath, {
       resource_type: resourceType,
       public_id: publicId,
       overwrite: true
     });
-    console.log('      [OK] SUCCESS!');
-    console.log('      URL: ' + result.secure_url);
+    console.log('      [OK] SUCCESS: ' + result.secure_url);
     return result.secure_url;
   } catch (error) {
     console.log('      [X] FAILED: ' + error.message);
-    if (error.http_code) {
-      console.log('      HTTP Code: ' + error.http_code);
-    }
     return null;
   }
 }
@@ -240,7 +255,7 @@ app.get('/health', function(req, res) {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.9.3',
+    version: '2.9.4',
     activeRuns: activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
@@ -267,12 +282,8 @@ app.post('/webhook/run', async function(req, res) {
   
   if (payload.suite && payload.suite.tests) {
     payload.suite.tests.forEach(function(test, idx) {
-      var idType = isValidUUID(test.id) ? '[OK] UUID' : '[X] NOT UUID';
-      var hasStepsUrl = test.steps_json_url ? '[OK] Has steps_json_url' : '[!] No steps_json_url';
-      console.log('   Test ' + (idx + 1) + ': id="' + test.id + '" (' + idType + ') ' + hasStepsUrl);
-      if (test.steps_json_url) {
-        console.log('      steps_json_url: ' + test.steps_json_url);
-      }
+      var hasStepsUrl = test.steps_json_url ? '[OK]' : '[X]';
+      console.log('   Test ' + (idx + 1) + ': ' + test.name + ' ' + hasStepsUrl + ' steps_json_url');
     });
   }
   
@@ -360,6 +371,69 @@ async function processQueue() {
 }
 
 // ============================================================
+// EXECUTE STEP (Lovable format)
+// ============================================================
+
+async function executeStep(page, step, baseUrl) {
+  var stepType = step.type || 'unknown';
+  var data = step.data || {};
+  
+  console.log('      Executing: ' + stepType);
+  
+  switch (stepType) {
+    case 'navigate':
+      var url = data.url || baseUrl;
+      console.log('      Navigating to: ' + url);
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+      break;
+      
+    case 'click':
+      var clickTarget = await findElement(page, data.targetHints);
+      if (clickTarget._useBoundingBox) {
+        console.log('      Clicking at coordinates: ' + clickTarget.x + ', ' + clickTarget.y);
+        await page.mouse.click(clickTarget.x, clickTarget.y);
+      } else {
+        await clickTarget.click();
+      }
+      break;
+      
+    case 'input':
+      var inputTarget = await findElement(page, data.targetHints);
+      if (inputTarget._useBoundingBox) {
+        await page.mouse.click(inputTarget.x, inputTarget.y);
+        await page.keyboard.type(data.value || '');
+      } else {
+        await inputTarget.fill(data.value || '');
+      }
+      break;
+      
+    case 'keydown':
+      var key = data.key || 'Enter';
+      console.log('      Pressing key: ' + key);
+      await page.keyboard.press(key);
+      break;
+      
+    case 'scroll':
+      var scrollY = data.y || 100;
+      console.log('      Scrolling: ' + scrollY + 'px');
+      await page.mouse.wheel(0, scrollY);
+      break;
+      
+    case 'wait':
+      var duration = data.duration || 1000;
+      console.log('      Waiting: ' + duration + 'ms');
+      await page.waitForTimeout(duration);
+      break;
+      
+    default:
+      console.log('      [!] Unknown step type: ' + stepType);
+  }
+  
+  // Small delay between steps for stability
+  await page.waitForTimeout(500);
+}
+
+// ============================================================
 // TEST EXECUTION
 // ============================================================
 
@@ -384,12 +458,11 @@ async function executeRun(payload) {
     fs.rmSync(runArtifactsDir, { recursive: true, force: true });
   }
   fs.mkdirSync(runArtifactsDir, { recursive: true });
-  console.log('[DIR] Artifacts directory: ' + runArtifactsDir);
 
   var shouldRecordVideo = !artifacts || artifacts.recordVideo !== false;
   
   var contextOptions = {
-    viewport: { width: 1280, height: 720 },
+    viewport: { width: 1920, height: 1080 },
     ignoreHTTPSErrors: true
   };
 
@@ -397,7 +470,7 @@ async function executeRun(payload) {
     console.log('[VIDEO] Recording ENABLED');
     contextOptions.recordVideo = {
       dir: runArtifactsDir,
-      size: { width: 1280, height: 720 }
+      size: { width: 1920, height: 1080 }
     };
   }
 
@@ -418,71 +491,9 @@ async function executeRun(payload) {
     test_results: []
   };
 
-  var stepCounter = 0;
   var uploadedScreenshots = [];
 
   try {
-    // Navigate to Power Apps URL
-    var navStartTime = new Date().toISOString();
-    console.log('\n[NAV] Navigating to: ' + environment.powerapps_url);
-    
-    await page.goto(environment.powerapps_url, { 
-      waitUntil: 'load',
-      timeout: 60000 
-    });
-    console.log('[OK] Page loaded');
-
-    console.log('[WAIT] Waiting for Power Apps to initialize...');
-    await page.waitForTimeout(5000);
-    
-    try {
-      await page.waitForSelector('[class*="spinner"], [class*="loading"]', { 
-        state: 'hidden', 
-        timeout: 10000 
-      });
-    } catch (e) {}
-    
-    console.log('[OK] Page ready');
-
-    // Take navigation screenshot
-    console.log('\n[SCREENSHOT] Taking navigation screenshot...');
-    var navScreenshotPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_nav.png');
-    await page.screenshot({ path: navScreenshotPath });
-    console.log('   Saved to: ' + navScreenshotPath);
-    
-    var navEndTime = new Date().toISOString();
-    
-    // Upload navigation screenshot
-    var navScreenshotUrl = await uploadToCloudinary(
-      navScreenshotPath,
-      'run_' + runIdClean + '_step_' + stepCounter + '_nav',
-      'image'
-    );
-    
-    if (navScreenshotUrl) {
-      uploadedScreenshots.push(navScreenshotUrl);
-    }
-
-    // Navigation step
-    var navigationStep = {
-      step_index: stepCounter,
-      action_type: 'navigate',
-      target_summary: environment.powerapps_url,
-      status: 'passed',
-      started_at: navStartTime,
-      finished_at: navEndTime,
-      screenshot_url: navScreenshotUrl,
-      assertion_evidence: [{
-        type: 'navigation',
-        expected: 'Page should load successfully',
-        actual: 'Page loaded successfully',
-        passed: true
-      }]
-    };
-    
-    console.log('   Step ' + stepCounter + ' screenshot_url: ' + (navScreenshotUrl || 'NULL'));
-    stepCounter++;
-
     // Execute each test
     for (var t = 0; t < suite.tests.length; t++) {
       var test = suite.tests[t];
@@ -493,141 +504,131 @@ async function executeRun(payload) {
       var testCaseId = isValidUUID(test.id) ? test.id : null;
       console.log('   test_case_id: ' + testCaseId);
       
-      // FETCH STEPS FROM URL
-      var testSteps = [];
+      // DOWNLOAD THE RECORDING STEPS
+      var steps = [];
       if (test.steps_json_url) {
-        console.log('   [!] Found steps_json_url - fetching...');
-        testSteps = await fetchStepsFromUrl(test.steps_json_url);
-      } else if (test.steps && Array.isArray(test.steps)) {
-        testSteps = test.steps;
-        console.log('   [OK] Using inline steps: ' + testSteps.length);
+        steps = await fetchStepsFromUrl(test.steps_json_url);
       } else {
-        console.log('   [!] No steps source found');
+        console.log('   [X] No steps_json_url provided!');
       }
       
-      var testResultSteps = [navigationStep];
+      var stepResults = [];
       var testStatus = 'passed';
 
-      if (testSteps.length === 0) {
-        console.log('   [!] No steps to execute, creating verification step');
+      if (steps.length === 0) {
+        console.log('   [!] No steps to execute');
         
-        var verifyStartTime = new Date().toISOString();
-        var verifyPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_verify.png');
+        // Navigate to base URL and take verification screenshot
+        console.log('   Navigating to: ' + environment.powerapps_url);
+        await page.goto(environment.powerapps_url, { waitUntil: 'load', timeout: 60000 });
+        await page.waitForTimeout(5000);
+        
+        var verifyTime = new Date().toISOString();
+        var verifyPath = path.join(runArtifactsDir, 'step_0_verify.png');
         await page.screenshot({ path: verifyPath });
-        var verifyEndTime = new Date().toISOString();
         
-        var verifyUrl = await uploadToCloudinary(
-          verifyPath,
-          'run_' + runIdClean + '_step_' + stepCounter + '_verify',
-          'image'
-        );
+        var verifyUrl = await uploadToCloudinary(verifyPath, 'run_' + runIdClean + '_step_0', 'image');
+        if (verifyUrl) uploadedScreenshots.push(verifyUrl);
         
-        if (verifyUrl) {
-          uploadedScreenshots.push(verifyUrl);
-        }
-        
-        console.log('   Step ' + stepCounter + ' screenshot_url: ' + (verifyUrl || 'NULL'));
-        
-        testResultSteps.push({
-          step_index: stepCounter,
-          action_type: 'verify',
-          target_summary: 'Page state verification',
+        stepResults.push({
+          step_index: 0,
+          action_type: 'navigate',
+          target_summary: environment.powerapps_url,
           status: 'passed',
-          started_at: verifyStartTime,
-          finished_at: verifyEndTime,
+          started_at: verifyTime,
+          finished_at: new Date().toISOString(),
           screenshot_url: verifyUrl,
           assertion_evidence: [{
-            type: 'verification',
-            expected: 'Page should be in expected state',
-            actual: 'Page state verified',
+            type: 'navigation',
+            expected: 'Page should load',
+            actual: 'Page loaded successfully',
             passed: true
           }]
         });
-        
-        stepCounter++;
       } else {
-        // Execute each step from the fetched steps
-        console.log('\n   EXECUTING ' + testSteps.length + ' STEPS:');
+        // EXECUTE EACH STEP FROM THE RECORDING
+        console.log('\n   Executing ' + steps.length + ' recorded steps...\n');
         
-        for (var i = 0; i < testSteps.length; i++) {
-          var rawStep = testSteps[i];
-          var step = normalizeStep(rawStep);
+        for (var i = 0; i < steps.length; i++) {
+          var step = steps[i];
           var stepStartTime = new Date().toISOString();
+          var stepType = step.type || 'unknown';
+          var targetSummary = getTargetSummary(step);
           
-          console.log('\n   ----------------------------------------');
-          console.log('   Step ' + stepCounter + ' (index ' + i + ')');
-          console.log('   Raw: ' + JSON.stringify(rawStep));
-          console.log('   Normalized action: ' + step.action);
-          console.log('   Selector: ' + (step.selector || 'none'));
-          console.log('   Text: ' + (step.text || 'none'));
-          console.log('   Value: ' + (step.value || 'none'));
-
-          // Take BEFORE screenshot
-          var beforePath = path.join(runArtifactsDir, 'step_' + stepCounter + '_before.png');
-          await page.screenshot({ path: beforePath });
-
-          // Execute the step
-          var stepExecution = await executeStep(page, step);
-
-          // Take AFTER screenshot
-          console.log('   [SCREENSHOT] Taking step screenshot...');
-          var afterPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_after.png');
-          await page.screenshot({ path: afterPath });
+          console.log('   ----------------------------------------');
+          console.log('   Step ' + i + ': ' + stepType + ' - ' + targetSummary);
           
-          var stepEndTime = new Date().toISOString();
-
-          // Upload AFTER screenshot
-          var screenshotUrl = await uploadToCloudinary(
-            afterPath,
-            'run_' + runIdClean + '_step_' + stepCounter,
-            'image'
-          );
-          
-          if (screenshotUrl) {
-            uploadedScreenshots.push(screenshotUrl);
-          }
-          
-          // Upload BEFORE screenshot (baseline)
-          var baselineUrl = await uploadToCloudinary(
-            beforePath,
-            'run_' + runIdClean + '_step_' + stepCounter + '_baseline',
-            'image'
-          );
-
-          console.log('   screenshot_url: ' + (screenshotUrl || 'NULL'));
-          console.log('   baseline_screenshot_url: ' + (baselineUrl || 'NULL'));
-
-          var targetSummary = step.selector || step.text || step.value || 'Unknown target';
-
-          testResultSteps.push({
-            step_index: stepCounter,
-            action_type: step.action,
-            target_summary: targetSummary,
-            status: stepExecution.status,
-            started_at: stepStartTime,
-            finished_at: stepEndTime,
-            screenshot_url: screenshotUrl,
-            baseline_screenshot_url: baselineUrl,
-            visual_diff_score: stepExecution.status === 'passed' ? 100 : 0,
-            assertion_evidence: [{
-              type: step.action,
-              expected: 'Action "' + step.action + '" should complete',
-              actual: stepExecution.status === 'passed' 
-                ? 'Action completed successfully' 
-                : stepExecution.error,
-              passed: stepExecution.status === 'passed'
-            }]
-          });
-          
-          stepCounter++;
-
-          if (stepExecution.status === 'failed') {
+          try {
+            // Execute the step
+            await executeStep(page, step, environment.powerapps_url);
+            
+            // Capture screenshot after step
+            var screenshotPath = path.join(runArtifactsDir, 'step_' + i + '.png');
+            await page.screenshot({ path: screenshotPath });
+            
+            var screenshotUrl = await uploadToCloudinary(
+              screenshotPath,
+              'run_' + runIdClean + '_step_' + i,
+              'image'
+            );
+            
+            if (screenshotUrl) uploadedScreenshots.push(screenshotUrl);
+            
+            stepResults.push({
+              step_index: i,
+              action_type: stepType,
+              target_summary: targetSummary,
+              status: 'passed',
+              started_at: stepStartTime,
+              finished_at: new Date().toISOString(),
+              screenshot_url: screenshotUrl,
+              assertion_evidence: [{
+                type: stepType,
+                expected: 'Step "' + stepType + '" should complete',
+                actual: 'Action completed successfully',
+                passed: true
+              }]
+            });
+            
+            console.log('   [OK] Step ' + i + ' passed');
+            
+          } catch (err) {
+            console.log('   [X] Step ' + i + ' failed: ' + err.message);
+            
+            // Capture failure screenshot
+            var failPath = path.join(runArtifactsDir, 'step_' + i + '_fail.png');
+            try {
+              await page.screenshot({ path: failPath });
+            } catch (e) {}
+            
+            var failUrl = await uploadToCloudinary(
+              failPath,
+              'run_' + runIdClean + '_step_' + i + '_fail',
+              'image'
+            );
+            
+            if (failUrl) uploadedScreenshots.push(failUrl);
+            
+            stepResults.push({
+              step_index: i,
+              action_type: stepType,
+              target_summary: targetSummary,
+              status: 'failed',
+              started_at: stepStartTime,
+              finished_at: new Date().toISOString(),
+              screenshot_url: failUrl,
+              error_message: err.message,
+              assertion_evidence: [{
+                type: stepType,
+                expected: 'Step "' + stepType + '" should complete',
+                actual: err.message,
+                passed: false
+              }]
+            });
+            
             testStatus = 'failed';
             results.overall_status = 'failed';
-            console.log('   [X] Failed: ' + stepExecution.error);
-            // Continue to next step instead of breaking - capture all results
-          } else {
-            console.log('   [OK] Passed');
+            break; // Stop on first failure
           }
         }
       }
@@ -635,92 +636,14 @@ async function executeRun(payload) {
       results.test_results.push({
         test_case_id: testCaseId,
         status: testStatus,
-        steps: testResultSteps
+        steps: stepResults
       });
     }
-
-    // If no tests, create default
-    if (results.test_results.length === 0) {
-      var defaultStartTime = new Date().toISOString();
-      var defaultPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_default.png');
-      await page.screenshot({ path: defaultPath });
-      var defaultEndTime = new Date().toISOString();
-      
-      var defaultUrl = await uploadToCloudinary(
-        defaultPath,
-        'run_' + runIdClean + '_step_' + stepCounter + '_default',
-        'image'
-      );
-      
-      if (defaultUrl) {
-        uploadedScreenshots.push(defaultUrl);
-      }
-      
-      results.test_results.push({
-        test_case_id: null,
-        status: 'passed',
-        steps: [
-          navigationStep,
-          {
-            step_index: stepCounter,
-            action_type: 'verify',
-            target_summary: 'Default page verification',
-            status: 'passed',
-            started_at: defaultStartTime,
-            finished_at: defaultEndTime,
-            screenshot_url: defaultUrl,
-            assertion_evidence: [{
-              type: 'verification',
-              expected: 'Page should load',
-              actual: 'Page loaded successfully',
-              passed: true
-            }]
-          }
-        ]
-      });
-    }
-
-    await page.waitForTimeout(2000);
 
   } catch (error) {
     console.error('\n[X] Execution error: ' + error.message);
     results.overall_status = 'failed';
     results.error_message = error.message;
-    
-    var errorTime = new Date().toISOString();
-    
-    var errorScreenshotUrl = null;
-    try {
-      var errorPath = path.join(runArtifactsDir, 'error_screenshot.png');
-      await page.screenshot({ path: errorPath, fullPage: true });
-      errorScreenshotUrl = await uploadToCloudinary(
-        errorPath,
-        'run_' + runIdClean + '_error',
-        'image'
-      );
-    } catch (e) {}
-    
-    if (results.test_results.length === 0) {
-      results.test_results.push({
-        test_case_id: null,
-        status: 'failed',
-        steps: [{
-          step_index: 0,
-          action_type: 'error',
-          target_summary: 'Execution Error',
-          status: 'failed',
-          started_at: errorTime,
-          finished_at: errorTime,
-          screenshot_url: errorScreenshotUrl,
-          assertion_evidence: [{
-            type: 'error',
-            expected: 'Test execution to complete',
-            actual: error.message,
-            passed: false
-          }]
-        }]
-      });
-    }
   }
 
   // Video capture
@@ -735,23 +658,18 @@ async function executeRun(payload) {
       
       if (video) {
         videoPath = await video.path();
-        console.log('   Video path from API: ' + videoPath);
       }
 
       await page.close();
       await context.close();
       
-      console.log('   Waiting for video file to finalize...');
       await new Promise(function(resolve) { setTimeout(resolve, 3000); });
 
       if (!videoPath || !fs.existsSync(videoPath)) {
-        console.log('   Looking for video files in: ' + runArtifactsDir);
         var files = fs.readdirSync(runArtifactsDir);
-        console.log('   Files found: ' + files.join(', '));
         var videoFiles = files.filter(function(f) { return f.endsWith('.webm'); });
         if (videoFiles.length > 0) {
           videoPath = path.join(runArtifactsDir, videoFiles[0]);
-          console.log('   Found video: ' + videoPath);
         }
       }
 
@@ -766,11 +684,7 @@ async function executeRun(payload) {
             'video'
           );
           results.replay_video_url = videoUrl;
-        } else {
-          console.log('   [!] Video too small, skipping upload');
         }
-      } else {
-        console.log('   [!] No video file found');
       }
     } catch (videoError) {
       console.error('   Video error: ' + videoError.message);
@@ -794,144 +708,9 @@ async function executeRun(payload) {
   console.log('   Tests: ' + results.test_results.length);
   console.log('   Screenshots uploaded: ' + uploadedScreenshots.length);
   console.log('   Video URL: ' + (results.replay_video_url || 'NONE'));
-  
-  if (uploadedScreenshots.length > 0) {
-    console.log('\n   [SCREENSHOTS] URLs:');
-    uploadedScreenshots.forEach(function(url, idx) {
-      console.log('      ' + (idx + 1) + '. ' + url);
-    });
-  } else {
-    console.log('\n   [!] NO SCREENSHOTS WERE UPLOADED!');
-  }
 
   await sendCallback(callbackUrl, results);
   return results;
-}
-
-async function executeStep(page, step) {
-  var result = { status: 'passed', error: null };
-  var timeout = step.timeout || 30000;
-
-  try {
-    var action = step.action || 'unknown';
-    
-    console.log('   Executing action: ' + action);
-    
-    switch (action) {
-      case 'click':
-        if (step.x && step.y) {
-          // Click by coordinates
-          console.log('      Clicking at coordinates: ' + step.x + ', ' + step.y);
-          await page.mouse.click(step.x, step.y);
-        } else if (step.selector || step.xpath || step.text) {
-          await getLocator(page, step).click({ timeout: timeout });
-        } else {
-          console.log('      [!] No target for click - skipping');
-        }
-        await page.waitForTimeout(500);
-        break;
-        
-      case 'fill':
-      case 'type':
-      case 'input':
-        var loc = getLocator(page, step);
-        if (step.clear !== false) {
-          try { await loc.clear({ timeout: timeout }); } catch (e) {}
-        }
-        await loc.fill(step.value || '', { timeout: timeout });
-        break;
-        
-      case 'select':
-      case 'dropdown':
-        try {
-          await getLocator(page, step).selectOption(step.value, { timeout: 5000 });
-        } catch (e) {
-          await getLocator(page, step).click({ timeout: timeout });
-          await page.waitForTimeout(500);
-          await page.getByText(step.value, { exact: false }).click({ timeout: timeout });
-        }
-        break;
-        
-      case 'wait':
-        if (step.selector) {
-          await page.waitForSelector(step.selector, { state: step.state || 'visible', timeout: timeout });
-        } else if (step.value) {
-          await page.waitForTimeout(parseInt(step.value));
-        } else {
-          await page.waitForLoadState('networkidle', { timeout: timeout });
-        }
-        break;
-        
-      case 'assert':
-      case 'verify':
-        var state = step.state || 'visible';
-        await getLocator(page, step).waitFor({ state: state, timeout: timeout });
-        break;
-        
-      case 'navigate':
-      case 'goto':
-        await page.goto(step.value || step.url, { waitUntil: 'load', timeout: timeout });
-        await page.waitForTimeout(2000);
-        break;
-        
-      case 'hover':
-        if (step.x && step.y) {
-          await page.mouse.move(step.x, step.y);
-        } else {
-          await getLocator(page, step).hover({ timeout: timeout });
-        }
-        break;
-        
-      case 'press':
-      case 'key':
-      case 'keypress':
-        await page.keyboard.press(step.value || step.key);
-        break;
-        
-      case 'scroll':
-        if (step.selector) {
-          await getLocator(page, step).scrollIntoViewIfNeeded();
-        } else {
-          await page.mouse.wheel(0, step.y || 300);
-        }
-        break;
-        
-      default:
-        console.log('      [!] Unknown action: ' + action + ' - taking screenshot only');
-    }
-  } catch (error) {
-    result.status = 'failed';
-    result.error = error.message;
-    console.log('      [X] Error: ' + error.message);
-  }
-
-  return result;
-}
-
-function getLocator(page, step) {
-  // Try multiple locator strategies
-  if (step.selector) {
-    console.log('      Using selector: ' + step.selector);
-    return page.locator(step.selector);
-  }
-  if (step.xpath) {
-    console.log('      Using xpath: ' + step.xpath);
-    return page.locator('xpath=' + step.xpath);
-  }
-  if (step.text) {
-    console.log('      Using text: ' + step.text);
-    return page.getByText(step.text, { exact: false });
-  }
-  if (step.original) {
-    // Check original step for more options
-    var orig = step.original;
-    if (orig.control_name) return page.locator('[data-control-name="' + orig.control_name + '"]');
-    if (orig.aria_label || orig.label) return page.getByLabel(orig.aria_label || orig.label);
-    if (orig.placeholder) return page.getByPlaceholder(orig.placeholder);
-    if (orig.role) return page.getByRole(orig.role, { name: orig.name });
-    if (orig.testId || orig.test_id) return page.getByTestId(orig.testId || orig.test_id);
-  }
-  throw new Error('No valid locator provided for step');
 }
 
 async function sendCallback(callbackUrl, payload) {
@@ -962,8 +741,8 @@ async function sendCallback(callbackUrl, payload) {
 
 app.listen(PORT, function() {
   console.log('\n============================================================');
-  console.log('  Power Apps Regression Runner v2.9.3');
-  console.log('  ENHANCED DEBUG - Full steps JSON logging');
+  console.log('  Power Apps Regression Runner v2.9.4');
+  console.log('  LOVABLE FORMAT: step.type + step.data.targetHints');
   console.log('============================================================');
   console.log('');
   console.log('  Port: ' + PORT);
