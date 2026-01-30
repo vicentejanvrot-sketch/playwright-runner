@@ -1,7 +1,7 @@
 /**
- * Power Apps Regression Recorder - Runner Service v2.9.1
+ * Power Apps Regression Recorder - Runner Service v2.9.2
  * 
- * NO EMOJIS - ASCII ONLY FOR DEPLOYMENT COMPATIBILITY
+ * FIX: Fetch steps from steps_json_url
  */
 
 const express = require('express');
@@ -63,7 +63,27 @@ function isValidUUID(str) {
 }
 
 // ============================================================
-// CLOUDINARY UPLOAD - WITH DETAILED LOGGING
+// HELPER: Fetch steps from URL
+// ============================================================
+async function fetchStepsFromUrl(stepsJsonUrl) {
+  console.log('   [FETCH] Downloading steps from: ' + stepsJsonUrl);
+  try {
+    const response = await fetch(stepsJsonUrl);
+    if (!response.ok) {
+      console.log('   [X] Failed to fetch steps: HTTP ' + response.status);
+      return [];
+    }
+    const steps = await response.json();
+    console.log('   [OK] Downloaded ' + steps.length + ' steps');
+    return steps;
+  } catch (error) {
+    console.log('   [X] Error fetching steps: ' + error.message);
+    return [];
+  }
+}
+
+// ============================================================
+// CLOUDINARY UPLOAD
 // ============================================================
 
 async function uploadToCloudinary(filePath, publicId, resourceType) {
@@ -119,7 +139,7 @@ app.get('/health', function(req, res) {
   res.json({ 
     status: 'healthy',
     service: 'playwright-runner',
-    version: '2.9.1',
+    version: '2.9.2',
     activeRuns: activeRuns,
     maxConcurrent: MAX_CONCURRENT_RUNS,
     queueLength: runQueue.length,
@@ -147,7 +167,8 @@ app.post('/webhook/run', async function(req, res) {
   if (payload.suite && payload.suite.tests) {
     payload.suite.tests.forEach(function(test, idx) {
       const idType = isValidUUID(test.id) ? '[OK] UUID' : '[X] NOT UUID';
-      console.log('   Test ' + (idx + 1) + ': id="' + test.id + '" (' + idType + ')');
+      const hasStepsUrl = test.steps_json_url ? '[OK] Has steps_json_url' : '[!] No steps_json_url';
+      console.log('   Test ' + (idx + 1) + ': id="' + test.id + '" (' + idType + ') ' + hasStepsUrl);
     });
   }
   
@@ -294,8 +315,6 @@ async function executeRun(payload) {
   };
 
   let stepCounter = 0;
-  
-  // Track all screenshot URLs for summary
   const uploadedScreenshots = [];
 
   try {
@@ -327,14 +346,6 @@ async function executeRun(payload) {
     await page.screenshot({ path: navScreenshotPath });
     console.log('   Saved to: ' + navScreenshotPath);
     
-    // Verify file was created
-    if (fs.existsSync(navScreenshotPath)) {
-      const stats = fs.statSync(navScreenshotPath);
-      console.log('   File exists: ' + (stats.size / 1024).toFixed(2) + ' KB');
-    } else {
-      console.log('   [X] File was NOT created!');
-    }
-    
     const navEndTime = new Date().toISOString();
     
     // Upload navigation screenshot
@@ -365,38 +376,43 @@ async function executeRun(payload) {
       }]
     };
     
-    console.log('\n   Step ' + stepCounter + ' screenshot_url: ' + (navScreenshotUrl || 'NULL'));
-    
+    console.log('   Step ' + stepCounter + ' screenshot_url: ' + (navScreenshotUrl || 'NULL'));
     stepCounter++;
 
     // Execute each test
-    for (let t = 0; t < suite.tests.length; t++) {
-      const test = suite.tests[t];
+    for (var t = 0; t < suite.tests.length; t++) {
+      var test = suite.tests[t];
       console.log('\n----------------------------------------');
       console.log('[TEST] ' + test.name);
       console.log('----------------------------------------');
       
-      const testCaseId = isValidUUID(test.id) ? test.id : null;
+      var testCaseId = isValidUUID(test.id) ? test.id : null;
       console.log('   test_case_id: ' + testCaseId);
       
-      const testSteps = test.steps || [];
-      const testResultSteps = [navigationStep];
-      let testStatus = 'passed';
+      // CRITICAL FIX: Fetch steps from steps_json_url if provided
+      var testSteps = [];
+      if (test.steps_json_url) {
+        console.log('   [!] Found steps_json_url - fetching...');
+        testSteps = await fetchStepsFromUrl(test.steps_json_url);
+      } else if (test.steps && Array.isArray(test.steps)) {
+        testSteps = test.steps;
+        console.log('   [OK] Using inline steps: ' + testSteps.length);
+      } else {
+        console.log('   [!] No steps found');
+      }
+      
+      var testResultSteps = [navigationStep];
+      var testStatus = 'passed';
 
       if (testSteps.length === 0) {
-        console.log('   [!] No steps in test, creating verification step');
+        console.log('   [!] No steps to execute, creating verification step');
         
-        const verifyStartTime = new Date().toISOString();
-        
-        // Take verification screenshot
-        console.log('\n[SCREENSHOT] Taking verification screenshot...');
-        const verifyPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_verify.png');
+        var verifyStartTime = new Date().toISOString();
+        var verifyPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_verify.png');
         await page.screenshot({ path: verifyPath });
+        var verifyEndTime = new Date().toISOString();
         
-        const verifyEndTime = new Date().toISOString();
-        
-        // Upload verification screenshot
-        const verifyUrl = await uploadToCloudinary(
+        var verifyUrl = await uploadToCloudinary(
           verifyPath,
           'run_' + runIdClean + '_step_' + stepCounter + '_verify',
           'image'
@@ -426,28 +442,32 @@ async function executeRun(payload) {
         
         stepCounter++;
       } else {
-        for (let i = 0; i < testSteps.length; i++) {
-          const step = testSteps[i];
-          const stepStartTime = new Date().toISOString();
+        // Execute each step from the fetched steps
+        for (var i = 0; i < testSteps.length; i++) {
+          var step = testSteps[i];
+          var stepStartTime = new Date().toISOString();
           
-          console.log('\n   Step ' + stepCounter + ': ' + step.action);
+          // Log step details
+          var stepAction = step.action || step.type || 'unknown';
+          var stepTarget = step.selector || step.control_name || step.text || step.target || 'unknown';
+          console.log('\n   Step ' + stepCounter + ': ' + stepAction + ' on ' + stepTarget);
 
           // Take BEFORE screenshot
-          const beforePath = path.join(runArtifactsDir, 'step_' + stepCounter + '_before.png');
+          var beforePath = path.join(runArtifactsDir, 'step_' + stepCounter + '_before.png');
           await page.screenshot({ path: beforePath });
 
           // Execute the step
-          const stepExecution = await executeStep(page, step);
+          var stepExecution = await executeStep(page, step);
 
           // Take AFTER screenshot
           console.log('   [SCREENSHOT] Taking step screenshot...');
-          const afterPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_after.png');
+          var afterPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_after.png');
           await page.screenshot({ path: afterPath });
           
-          const stepEndTime = new Date().toISOString();
+          var stepEndTime = new Date().toISOString();
 
-          // Upload AFTER screenshot (main screenshot)
-          const screenshotUrl = await uploadToCloudinary(
+          // Upload AFTER screenshot
+          var screenshotUrl = await uploadToCloudinary(
             afterPath,
             'run_' + runIdClean + '_step_' + stepCounter,
             'image'
@@ -458,7 +478,7 @@ async function executeRun(payload) {
           }
           
           // Upload BEFORE screenshot (baseline)
-          const baselineUrl = await uploadToCloudinary(
+          var baselineUrl = await uploadToCloudinary(
             beforePath,
             'run_' + runIdClean + '_step_' + stepCounter + '_baseline',
             'image'
@@ -469,7 +489,7 @@ async function executeRun(payload) {
 
           testResultSteps.push({
             step_index: stepCounter,
-            action_type: step.action ? step.action.toLowerCase() : 'unknown',
+            action_type: stepAction.toLowerCase(),
             target_summary: step.name || step.description || getTargetSummary(step),
             status: stepExecution.status,
             started_at: stepStartTime,
@@ -478,7 +498,7 @@ async function executeRun(payload) {
             baseline_screenshot_url: baselineUrl,
             visual_diff_score: stepExecution.status === 'passed' ? 100 : 0,
             assertion_evidence: [{
-              type: step.action ? step.action.toLowerCase() : 'action',
+              type: stepAction.toLowerCase(),
               expected: getExpectedOutcome(step),
               actual: stepExecution.status === 'passed' 
                 ? 'Action completed successfully' 
@@ -509,12 +529,12 @@ async function executeRun(payload) {
 
     // If no tests, create default
     if (results.test_results.length === 0) {
-      const defaultStartTime = new Date().toISOString();
-      const defaultPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_default.png');
+      var defaultStartTime = new Date().toISOString();
+      var defaultPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_default.png');
       await page.screenshot({ path: defaultPath });
-      const defaultEndTime = new Date().toISOString();
+      var defaultEndTime = new Date().toISOString();
       
-      const defaultUrl = await uploadToCloudinary(
+      var defaultUrl = await uploadToCloudinary(
         defaultPath,
         'run_' + runIdClean + '_step_' + stepCounter + '_default',
         'image'
@@ -555,11 +575,11 @@ async function executeRun(payload) {
     results.overall_status = 'failed';
     results.error_message = error.message;
     
-    const errorTime = new Date().toISOString();
+    var errorTime = new Date().toISOString();
     
-    let errorScreenshotUrl = null;
+    var errorScreenshotUrl = null;
     try {
-      const errorPath = path.join(runArtifactsDir, 'error_screenshot.png');
+      var errorPath = path.join(runArtifactsDir, 'error_screenshot.png');
       await page.screenshot({ path: errorPath, fullPage: true });
       errorScreenshotUrl = await uploadToCloudinary(
         errorPath,
@@ -598,8 +618,8 @@ async function executeRun(payload) {
 
   if (shouldRecordVideo) {
     try {
-      const video = page.video();
-      let videoPath = null;
+      var video = page.video();
+      var videoPath = null;
       
       if (video) {
         videoPath = await video.path();
@@ -614,9 +634,9 @@ async function executeRun(payload) {
 
       if (!videoPath || !fs.existsSync(videoPath)) {
         console.log('   Looking for video files in: ' + runArtifactsDir);
-        const files = fs.readdirSync(runArtifactsDir);
+        var files = fs.readdirSync(runArtifactsDir);
         console.log('   Files found: ' + files.join(', '));
-        const videoFiles = files.filter(function(f) { return f.endsWith('.webm'); });
+        var videoFiles = files.filter(function(f) { return f.endsWith('.webm'); });
         if (videoFiles.length > 0) {
           videoPath = path.join(runArtifactsDir, videoFiles[0]);
           console.log('   Found video: ' + videoPath);
@@ -624,11 +644,11 @@ async function executeRun(payload) {
       }
 
       if (videoPath && fs.existsSync(videoPath)) {
-        const stats = fs.statSync(videoPath);
+        var stats = fs.statSync(videoPath);
         console.log('   Video size: ' + (stats.size / 1024).toFixed(2) + ' KB');
 
         if (stats.size > 1000) {
-          const videoUrl = await uploadToCloudinary(
+          var videoUrl = await uploadToCloudinary(
             videoPath,
             'run_' + runIdClean + '_video',
             'video'
@@ -651,7 +671,7 @@ async function executeRun(payload) {
   try { await browser.close(); } catch (e) {}
   try { fs.rmSync(runArtifactsDir, { recursive: true, force: true }); } catch (e) {}
 
-  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  var duration = ((Date.now() - startTime) / 1000).toFixed(1);
   
   // Summary
   console.log('\n============================================================');
@@ -670,7 +690,6 @@ async function executeRun(payload) {
     });
   } else {
     console.log('\n   [!] NO SCREENSHOTS WERE UPLOADED!');
-    console.log('   Check Cloudinary configuration above.');
   }
 
   await sendCallback(callbackUrl, results);
@@ -682,12 +701,14 @@ function getTargetSummary(step) {
   if (step.control_name) return 'Control: ' + step.control_name;
   if (step.text) return 'Text: "' + step.text + '"';
   if (step.aria_label) return 'Label: ' + step.aria_label;
+  if (step.target) return step.target;
   if (step.url || step.value) return step.url || step.value;
   return 'Unknown target';
 }
 
 function getExpectedOutcome(step) {
-  var action = step.action ? step.action.toLowerCase() : '';
+  var action = step.action || step.type || '';
+  action = action.toLowerCase();
   switch (action) {
     case 'click': return 'Click on element should succeed';
     case 'fill':
@@ -700,16 +721,18 @@ function getExpectedOutcome(step) {
     case 'verify': return 'Element should be ' + (step.type || 'visible');
     case 'navigate':
     case 'goto': return 'Page should navigate successfully';
-    default: return 'Action "' + step.action + '" should complete';
+    default: return 'Action "' + action + '" should complete';
   }
 }
 
 async function executeStep(page, step) {
-  const result = { status: 'passed', error: null };
-  const timeout = step.timeout || 30000;
+  var result = { status: 'passed', error: null };
+  var timeout = step.timeout || 30000;
 
   try {
-    var action = step.action ? step.action.toLowerCase() : '';
+    var action = step.action || step.type || '';
+    action = action.toLowerCase();
+    
     switch (action) {
       case 'click':
         await getLocator(page, step).click({ timeout: timeout });
@@ -719,7 +742,9 @@ async function executeStep(page, step) {
       case 'type':
       case 'input':
         var loc = getLocator(page, step);
-        if (step.clear !== false) await loc.clear({ timeout: timeout });
+        if (step.clear !== false) {
+          try { await loc.clear({ timeout: timeout }); } catch (e) {}
+        }
         await loc.fill(step.value || '', { timeout: timeout });
         break;
       case 'select':
@@ -743,8 +768,8 @@ async function executeStep(page, step) {
         break;
       case 'assert':
       case 'verify':
-        var type = step.type || 'visible';
-        await getLocator(page, step).waitFor({ state: type, timeout: timeout });
+        var state = step.state || step.type || 'visible';
+        await getLocator(page, step).waitFor({ state: state, timeout: timeout });
         break;
       case 'navigate':
       case 'goto':
@@ -758,8 +783,15 @@ async function executeStep(page, step) {
       case 'key':
         await page.keyboard.press(step.key || step.value);
         break;
+      case 'scroll':
+        if (step.selector) {
+          await getLocator(page, step).scrollIntoViewIfNeeded();
+        } else {
+          await page.mouse.wheel(0, step.y || 300);
+        }
+        break;
       default:
-        console.log('      [!] Unknown action: ' + step.action);
+        console.log('      [!] Unknown action: ' + action + ' - skipping');
     }
   } catch (error) {
     result.status = 'failed';
@@ -770,13 +802,21 @@ async function executeStep(page, step) {
 }
 
 function getLocator(page, step) {
+  // Try multiple locator strategies
   if (step.selector) return page.locator(step.selector);
   if (step.control_name) return page.locator('[data-control-name="' + step.control_name + '"]');
-  if (step.text) return page.getByText(step.text, { exact: step.exact });
-  if (step.aria_label) return page.getByLabel(step.aria_label);
+  if (step.xpath) return page.locator('xpath=' + step.xpath);
+  if (step.text) return page.getByText(step.text, { exact: step.exact !== false });
+  if (step.aria_label || step.label) return page.getByLabel(step.aria_label || step.label);
   if (step.placeholder) return page.getByPlaceholder(step.placeholder);
   if (step.role) return page.getByRole(step.role, { name: step.name });
-  throw new Error('No valid locator provided');
+  if (step.testId || step.test_id) return page.getByTestId(step.testId || step.test_id);
+  if (step.target) {
+    // Try to parse target as a selector
+    if (step.target.startsWith('//')) return page.locator('xpath=' + step.target);
+    return page.locator(step.target);
+  }
+  throw new Error('No valid locator provided for step');
 }
 
 async function sendCallback(callbackUrl, payload) {
@@ -786,13 +826,13 @@ async function sendCallback(callbackUrl, payload) {
   console.log(JSON.stringify(payload, null, 2));
 
   try {
-    const response = await fetch(callbackUrl, {
+    var response = await fetch(callbackUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
 
-    const responseText = await response.text();
+    var responseText = await response.text();
     
     if (!response.ok) {
       console.error('\n[X] Callback failed: ' + response.status + ' - ' + responseText);
@@ -807,8 +847,8 @@ async function sendCallback(callbackUrl, payload) {
 
 app.listen(PORT, function() {
   console.log('\n============================================================');
-  console.log('  Power Apps Regression Runner v2.9.1');
-  console.log('  ASCII-ONLY VERSION');
+  console.log('  Power Apps Regression Runner v2.9.2');
+  console.log('  NOW FETCHES STEPS FROM steps_json_url');
   console.log('============================================================');
   console.log('');
   console.log('  Port: ' + PORT);
@@ -818,3 +858,31 @@ app.listen(PORT, function() {
 });
 
 module.exports = app;
+```
+
+---
+
+## Key Changes in v2.9.2:
+
+| Feature | Description |
+|---------|-------------|
+| **`fetchStepsFromUrl()`** | New function that downloads steps JSON from the URL |
+| **Steps loading logic** | Checks for `test.steps_json_url` first, fetches if present |
+| **Better logging** | Shows `[FETCH] Downloading steps from: ...` |
+| **Enhanced locators** | Added `xpath`, `target`, `testId` support |
+
+---
+
+## What to look for in logs after deploying:
+```
+[TEST] Your Test Name
+   test_case_id: abc-123-...
+   [!] Found steps_json_url - fetching...
+   [FETCH] Downloading steps from: https://...
+   [OK] Downloaded 5 steps
+
+   Step 1: click on Element: .button
+   [SCREENSHOT] Taking step screenshot...
+   [UPLOAD] ATTEMPT:
+      [OK] SUCCESS!
+      URL: https://res.cloudinary.com/...
