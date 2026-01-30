@@ -2,6 +2,7 @@
  * Power Apps Regression Recorder - Runner Service v2.9.2
  * 
  * FIX: Fetch steps from steps_json_url
+ * ASCII-only version for compatibility
  */
 
 const express = require('express');
@@ -31,7 +32,7 @@ console.log('   CLOUDINARY_API_KEY: ' + (CLOUDINARY_API_KEY ? '"' + CLOUDINARY_A
 console.log('   CLOUDINARY_API_SECRET: ' + (CLOUDINARY_API_SECRET ? '"***" (hidden)' : '[X] NOT SET'));
 
 // Initialize Cloudinary
-let cloudinary = null;
+var cloudinary = null;
 if (CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET) {
   cloudinary = require('cloudinary').v2;
   cloudinary.config({
@@ -50,15 +51,15 @@ if (!fs.existsSync(ARTIFACTS_DIR)) {
 }
 
 // Track active runs
-let activeRuns = 0;
-const runQueue = [];
+var activeRuns = 0;
+var runQueue = [];
 
 // ============================================================
 // HELPER: Check if string is a valid UUID
 // ============================================================
 function isValidUUID(str) {
   if (!str || typeof str !== 'string') return false;
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  var uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   return uuidRegex.test(str);
 }
 
@@ -68,12 +69,12 @@ function isValidUUID(str) {
 async function fetchStepsFromUrl(stepsJsonUrl) {
   console.log('   [FETCH] Downloading steps from: ' + stepsJsonUrl);
   try {
-    const response = await fetch(stepsJsonUrl);
+    var response = await fetch(stepsJsonUrl);
     if (!response.ok) {
       console.log('   [X] Failed to fetch steps: HTTP ' + response.status);
       return [];
     }
-    const steps = await response.json();
+    var steps = await response.json();
     console.log('   [OK] Downloaded ' + steps.length + ' steps');
     return steps;
   } catch (error) {
@@ -104,7 +105,7 @@ async function uploadToCloudinary(filePath, publicId, resourceType) {
     return null;
   }
 
-  const stats = fs.statSync(filePath);
+  var stats = fs.statSync(filePath);
   console.log('      File size: ' + (stats.size / 1024).toFixed(2) + ' KB');
   
   if (stats.size < 100) {
@@ -114,7 +115,7 @@ async function uploadToCloudinary(filePath, publicId, resourceType) {
 
   try {
     console.log('      [..] Uploading to Cloudinary...');
-    const result = await cloudinary.uploader.upload(filePath, {
+    var result = await cloudinary.uploader.upload(filePath, {
       resource_type: resourceType,
       public_id: publicId,
       overwrite: true
@@ -149,14 +150,14 @@ app.get('/health', function(req, res) {
 });
 
 app.post('/webhook/run', async function(req, res) {
-  const payload = req.body;
+  var payload = req.body;
   
   console.log('\n============================================================');
   console.log('[INCOMING] PAYLOAD');
   console.log('============================================================');
   console.log(JSON.stringify(payload, null, 2));
   
-  const errors = validatePayload(payload);
+  var errors = validatePayload(payload);
   if (errors.length > 0) {
     return res.status(400).json({ error: 'Invalid payload', details: errors });
   }
@@ -166,8 +167,8 @@ app.post('/webhook/run', async function(req, res) {
   
   if (payload.suite && payload.suite.tests) {
     payload.suite.tests.forEach(function(test, idx) {
-      const idType = isValidUUID(test.id) ? '[OK] UUID' : '[X] NOT UUID';
-      const hasStepsUrl = test.steps_json_url ? '[OK] Has steps_json_url' : '[!] No steps_json_url';
+      var idType = isValidUUID(test.id) ? '[OK] UUID' : '[X] NOT UUID';
+      var hasStepsUrl = test.steps_json_url ? '[OK] Has steps_json_url' : '[!] No steps_json_url';
       console.log('   Test ' + (idx + 1) + ': id="' + test.id + '" (' + idType + ') ' + hasStepsUrl);
     });
   }
@@ -183,8 +184,8 @@ app.post('/webhook/run', async function(req, res) {
 });
 
 app.post('/webhook/cancel/:runId', function(req, res) {
-  const runId = req.params.runId;
-  const queueIndex = runQueue.findIndex(function(p) { return p.runId === runId; });
+  var runId = req.params.runId;
+  var queueIndex = runQueue.findIndex(function(p) { return p.runId === runId; });
   if (queueIndex >= 0) {
     runQueue.splice(queueIndex, 1);
     return res.json({ status: 'cancelled', runId: runId });
@@ -197,7 +198,7 @@ app.post('/webhook/cancel/:runId', function(req, res) {
 // ============================================================
 
 function validatePayload(payload) {
-  const errors = [];
+  var errors = [];
   if (!payload.runId) errors.push('Missing: runId');
   if (!payload.environment) errors.push('Missing: environment');
   if (!payload.environment || !payload.environment.powerapps_url) errors.push('Missing: environment.powerapps_url');
@@ -217,14 +218,14 @@ async function processQueue() {
   if (activeRuns >= MAX_CONCURRENT_RUNS || runQueue.length === 0) return;
 
   activeRuns++;
-  const payload = runQueue.shift();
+  var payload = runQueue.shift();
   
   try {
     await executeRun(payload);
   } catch (error) {
     console.error('[X] Run ' + payload.runId + ' failed: ' + error.message);
     
-    const now = new Date().toISOString();
+    var now = new Date().toISOString();
     await sendCallback(payload.callbackUrl, {
       run_id: payload.runId,
       overall_status: 'failed',
@@ -260,31 +261,31 @@ async function processQueue() {
 // ============================================================
 
 async function executeRun(payload) {
-  const runId = payload.runId;
-  const environment = payload.environment;
-  const suite = payload.suite;
-  const callbackUrl = payload.callbackUrl;
-  const artifacts = payload.artifacts;
+  var runId = payload.runId;
+  var environment = payload.environment;
+  var suite = payload.suite;
+  var callbackUrl = payload.callbackUrl;
+  var artifacts = payload.artifacts;
   
   console.log('\n============================================================');
   console.log('[START] RUN: ' + runId);
   console.log('============================================================');
   console.log('\n[CLOUDINARY] Status: ' + (cloudinary ? '[OK] READY' : '[X] NOT CONFIGURED'));
   
-  const startTime = Date.now();
-  const runIdClean = runId.replace(/-/g, '_');
+  var startTime = Date.now();
+  var runIdClean = runId.replace(/-/g, '_');
   
   // Create run-specific artifacts directory
-  const runArtifactsDir = path.join(ARTIFACTS_DIR, runId);
+  var runArtifactsDir = path.join(ARTIFACTS_DIR, runId);
   if (fs.existsSync(runArtifactsDir)) {
     fs.rmSync(runArtifactsDir, { recursive: true, force: true });
   }
   fs.mkdirSync(runArtifactsDir, { recursive: true });
   console.log('[DIR] Artifacts directory: ' + runArtifactsDir);
 
-  const shouldRecordVideo = !artifacts || artifacts.recordVideo !== false;
+  var shouldRecordVideo = !artifacts || artifacts.recordVideo !== false;
   
-  const contextOptions = {
+  var contextOptions = {
     viewport: { width: 1280, height: 720 },
     ignoreHTTPSErrors: true
   };
@@ -298,28 +299,28 @@ async function executeRun(payload) {
   }
 
   console.log('[BROWSER] Launching...');
-  const browser = await chromium.launch({
+  var browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
   });
 
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
+  var context = await browser.newContext(contextOptions);
+  var page = await context.newPage();
   page.setDefaultTimeout(30000);
 
-  const results = {
+  var results = {
     run_id: runId,
     overall_status: 'passed',
     replay_video_url: null,
     test_results: []
   };
 
-  let stepCounter = 0;
-  const uploadedScreenshots = [];
+  var stepCounter = 0;
+  var uploadedScreenshots = [];
 
   try {
     // Navigate to Power Apps URL
-    const navStartTime = new Date().toISOString();
+    var navStartTime = new Date().toISOString();
     console.log('\n[NAV] Navigating to: ' + environment.powerapps_url);
     
     await page.goto(environment.powerapps_url, { 
@@ -342,14 +343,14 @@ async function executeRun(payload) {
 
     // Take navigation screenshot
     console.log('\n[SCREENSHOT] Taking navigation screenshot...');
-    const navScreenshotPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_nav.png');
+    var navScreenshotPath = path.join(runArtifactsDir, 'step_' + stepCounter + '_nav.png');
     await page.screenshot({ path: navScreenshotPath });
     console.log('   Saved to: ' + navScreenshotPath);
     
-    const navEndTime = new Date().toISOString();
+    var navEndTime = new Date().toISOString();
     
     // Upload navigation screenshot
-    const navScreenshotUrl = await uploadToCloudinary(
+    var navScreenshotUrl = await uploadToCloudinary(
       navScreenshotPath,
       'run_' + runIdClean + '_step_' + stepCounter + '_nav',
       'image'
@@ -360,7 +361,7 @@ async function executeRun(payload) {
     }
 
     // Navigation step
-    const navigationStep = {
+    var navigationStep = {
       step_index: stepCounter,
       action_type: 'navigate',
       target_summary: environment.powerapps_url,
@@ -858,31 +859,3 @@ app.listen(PORT, function() {
 });
 
 module.exports = app;
-```
-
----
-
-## Key Changes in v2.9.2:
-
-| Feature | Description |
-|---------|-------------|
-| **`fetchStepsFromUrl()`** | New function that downloads steps JSON from the URL |
-| **Steps loading logic** | Checks for `test.steps_json_url` first, fetches if present |
-| **Better logging** | Shows `[FETCH] Downloading steps from: ...` |
-| **Enhanced locators** | Added `xpath`, `target`, `testId` support |
-
----
-
-## What to look for in logs after deploying:
-```
-[TEST] Your Test Name
-   test_case_id: abc-123-...
-   [!] Found steps_json_url - fetching...
-   [FETCH] Downloading steps from: https://...
-   [OK] Downloaded 5 steps
-
-   Step 1: click on Element: .button
-   [SCREENSHOT] Taking step screenshot...
-   [UPLOAD] ATTEMPT:
-      [OK] SUCCESS!
-      URL: https://res.cloudinary.com/...
