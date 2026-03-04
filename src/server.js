@@ -18,6 +18,7 @@ app.use(express.json({ limit: '50mb' }));
 const PORT = process.env.PORT || 3001;
 const MAX_CONCURRENT_RUNS = parseInt(process.env.MAX_CONCURRENT_RUNS || '3');
 const ARTIFACTS_DIR = path.join(__dirname, '../artifacts');
+const RUNNER_SHARED_SECRET = (process.env.RUNNER_SHARED_SECRET || '').trim();
 
 // Cloudinary Configuration
 const CLOUDINARY_CLOUD_NAME = (process.env.CLOUDINARY_CLOUD_NAME || '').trim();
@@ -49,10 +50,18 @@ if (!fs.existsSync(ARTIFACTS_DIR)) {
 var activeRuns = 0;
 var runQueue = [];
 
-function isValidUUID(str) {
-  if (!str || typeof str !== 'string') return false;
-  var uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  return uuidRegex.test(str);
+function validateRunnerSecret(req, res, next) {
+  if (!RUNNER_SHARED_SECRET) {
+    return res.status(500).json({ error: 'RUNNER_SHARED_SECRET is not configured' });
+  }
+
+  var incomingSecret = req.header('x-runner-secret');
+
+  if (!incomingSecret || incomingSecret !== RUNNER_SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  next();
 }
 
 // ============================================================
@@ -290,7 +299,7 @@ app.get('/health', function(req, res) {
   });
 });
 
-app.post('/webhook/run', async function(req, res) {
+app.post('/webhook/run', validateRunnerSecret, async function(req, res) {
   var payload = req.body;
   
   console.log('\n============================================================');
