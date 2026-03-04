@@ -9,6 +9,7 @@ services:
       - PORT=3001
       - MAX_CONCURRENT_RUNS=3
       - PUBLIC_URL=http://localhost:3001
+      - RUNNER_SHARED_SECRET=QueOAmorUnicoDeDeusInspireTodasAsAlmasParaOBem
     volumes:
       # Persist artifacts outside container
       - ./artifacts:/app/artifacts
